@@ -37,8 +37,9 @@ jobs:
           curl -fL -o /tmp/makerom.tar.gz \
             https://github.com/3DSGuy/Project_CTR/archive/refs/tags/makerom-v0.19.0.tar.gz
           tar -xzf /tmp/makerom.tar.gz -C /tmp
+          make -C /tmp/Project_CTR-makerom-v0.19.0/makerom deps -j2
           make -C /tmp/Project_CTR-makerom-v0.19.0/makerom -j2
-          install -m 0755 /tmp/Project_CTR-makerom-v0.19.0/makerom/makerom \
+          install -m 0755 /tmp/Project_CTR-makerom-v0.19.0/makerom/bin/makerom \
             /usr/local/bin/makerom
 
       - name: Build 3DSX and CIA
