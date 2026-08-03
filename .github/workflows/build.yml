@@ -1,0 +1,57 @@
+name: Build Nintendo 3DS release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:20260610
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl unzip xz-utils
+
+      - name: Build FFmpeg portlibs
+        run: ./build-ffmpeg-3ds.sh
+
+      - name: Install CIA packaging tools
+        run: |
+          curl -fL -o /tmp/bannertool.zip \
+            https://github.com/diasurgical/bannertool/releases/download/1.2.0/bannertool.zip
+          unzip -q /tmp/bannertool.zip -d /tmp/bannertool
+          install -m 0755 /tmp/bannertool/linux-x86_64/bannertool /usr/local/bin/bannertool
+
+          curl -fL -o /tmp/makerom.zip \
+            https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.19.0/makerom-v0.19.0-ubuntu_x86_64.zip
+          unzip -q /tmp/makerom.zip -d /tmp/makerom
+          install -m 0755 /tmp/makerom/makerom /usr/local/bin/makerom
+
+      - name: Build 3DSX and CIA
+        run: make -j2 cia
+
+      - name: Create checksums
+        run: sha256sum bilibili.cia bilibili.3dsx bilibili.smdh > SHA256SUMS.txt
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bilibili-3ds-v1.3.0
+          if-no-files-found: error
+          path: |
+            bilibili.cia
+            bilibili.3dsx
+            bilibili.smdh
+            SHA256SUMS.txt
