@@ -34,10 +34,12 @@ jobs:
           unzip -q /tmp/bannertool.zip -d /tmp/bannertool
           install -m 0755 /tmp/bannertool/linux-x86_64/bannertool /usr/local/bin/bannertool
 
-          curl -fL -o /tmp/makerom.zip \
-            https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.19.0/makerom-v0.19.0-ubuntu_x86_64.zip
-          unzip -q /tmp/makerom.zip -d /tmp/makerom
-          install -m 0755 /tmp/makerom/makerom /usr/local/bin/makerom
+          curl -fL -o /tmp/makerom.tar.gz \
+            https://github.com/3DSGuy/Project_CTR/archive/refs/tags/makerom-v0.19.0.tar.gz
+          tar -xzf /tmp/makerom.tar.gz -C /tmp
+          make -C /tmp/Project_CTR-makerom-v0.19.0/makerom -j2
+          install -m 0755 /tmp/Project_CTR-makerom-v0.19.0/makerom/makerom \
+            /usr/local/bin/makerom
 
       - name: Build 3DSX and CIA
         run: make -j2 cia
