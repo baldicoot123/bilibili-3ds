@@ -835,15 +835,15 @@ static void draw_cache_page(int sel, const char *notice) {
 		                s_cache_view[sel].author, 300);
 	}
 	ui_rect(10, 112, 300, 48, C2D_Color32(0x26, 0x26, 0x30, 0xFF));
-	ui_text(18, 120, 0.65f, UI_SHARP, UI_COL_WHITE,
+	ui_text(18, 120, 0.65f, UI_COL_WHITE,
 	        "A 离线播放   X 暂停/继续/重试");
-	ui_text(18, 140, 0.65f, UI_SHARP, UI_COL_WHITE,
+	ui_text(18, 140, 0.65f, UI_COL_WHITE,
 	        "Y 删除       B 返回");
 	char worker[128];
 	download_worker_status(worker, sizeof(worker));
 	const char *line = notice && notice[0] ? notice : worker;
 	ui_rect(10, 174, 300, 52, C2D_Color32(0x1D, 0x1D, 0x26, 0xFF));
-	ui_text_clipped(18, 184, 0.6f, UI_SHARP, UI_COL_DIM,
+	ui_text_clipped(18, 184, 0.6f, UI_COL_DIM,
 	                line && line[0] ? line : "后台队列空闲", 284);
 	ui_end();
 }
