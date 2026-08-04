@@ -198,7 +198,7 @@ static void worker_main(void *unused) {
 				cache_manager_mark_waiting(&task);
 		} else if (result < 0) {
 			cache_manager_mark_failed(&task);
-			set_worker_status("下载失败，可在缓存列表重试");
+			set_worker_status("下载失败，可在离线下载任务中重试");
 		}
 		s_active = 0;
 		__dmb();
