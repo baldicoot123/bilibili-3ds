@@ -3654,9 +3654,17 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 					 * 否则「哪次算数」取决于用户从哪儿点的。 */
 					settings_set("danmaku", s_pref_danmaku);
 				}
-				if (ui_button(112, 100, 96, 40, "发弹幕",
-				              UI_COL_SEL, btn_touch, tp.px, tp.py))
-					want_dm_input = true;
+				/* 缓存按钮放到原“发弹幕”位置。旧位置在 y=154，会压住
+				 * y=178 的进度条和拖动命中区；这里属于标准按钮网格，
+				 * 不会再遮挡进度。 */
+				if (s_cache_cb &&
+				    ui_button(112, 100, 96, 40,
+				              s_pg_n > 1 ? "缓存本P" : "缓存视频",
+				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
+					s_toast[0] = 0;
+					s_cache_cb(false, s_toast, sizeof(s_toast));
+					s_toast_until = osGetTime() + 5000;
+				}
 				/* 右下角:评论区。视频不暂停 —— 双屏机器上「上屏看片、
 				 * 下屏看评论」本来就是最自然的用法 */
 				if (ui_button(214, 100, 96, 40, "评论",
@@ -3664,14 +3672,6 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 					in_comments = true;
 					if (s_meta_aid && comment_count() == 0 && !comment_loading())
 						comment_load_async(s_meta_aid, 1);
-				}
-				if (s_cache_cb &&
-				    ui_button(214, 154, 96, 38,
-				              s_pg_n > 1 ? "缓存本P" : "缓存视频",
-				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
-					s_toast[0] = 0;
-					s_cache_cb(false, s_toast, sizeof(s_toast));
-					s_toast_until = osGetTime() + 5000;
 				}
 				/* 3D 的说明挪到「设置」子页去了:主覆盖层这行是常用键位,
 				 * 塞进只在开 3D 时才有意义的话会挤掉真正常用的信息。 */

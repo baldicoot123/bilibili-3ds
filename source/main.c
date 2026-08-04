@@ -5,7 +5,7 @@
  *   A           播放(播放中 A 暂停 / B 退出)
  *   Y           搜索(下屏也有搜索按钮)
  *   X           播放中切换倍速;长按恢复 1.0x
- *   L / R       上一页 / 下一页
+ *   L / R       向上翻一屏 / 手动加载下一批
  *   SELECT      回到热门
  *   START       退出程序
  */
@@ -29,7 +29,12 @@
 #include "download_worker.h"
 #include "vendor/qrcodegen.h"
 
-#define MAX_LIST 20
+#define LIST_PAGE_SIZE 20
+/* 列表接口每次只给 20 条，但主页现在采用“滚到底继续追加”。
+ * BiliVideo 约 500B，1000 条不到 0.5MB，放普通堆/BSS 对 New 3DS 很轻；
+ * 同时给异常接口一个硬上限，不能真的让无穷流把掌机内存吃光。 */
+#define MAX_LIST 1000
+#define THUMB_WINDOW LIST_PAGE_SIZE
 
 /* 加大主线程栈(默认 32KB,ffmpeg 解码 + 深调用链不够用) */
 unsigned int __stacksize__ = 256 * 1024;
@@ -60,27 +65,31 @@ static BiliVideo s_list[MAX_LIST];
  * 归零 —— 上屏于是露出居中的「加载中」,下屏跳出「加载失败?按 A 重试」,
  * 都不是真的。拉到暂存里、成功了才整体换上,翻页就只是某一帧换成新的一页。
  * 20 条 x ~0.5KB,买得起;顺带让 B 取消变成真的无损。 */
-static BiliVideo s_stage[MAX_LIST];
+static BiliVideo s_stage[LIST_PAGE_SIZE];
 static int s_stage_n;
 static int  s_count = 0;
 static int  s_sel = 0;
 static float s_scroll = 0.0f;       /* 列表滚动偏移(显示值,像素) */
 static float s_scroll_t = 0.0f;     /* 滚动目标值:输入写这里,显示值每帧缓动跟随 */
 #define ROW_H   66.0f               /* 图文卡片行高 */
-#define LIST_Y  26.0f               /* 列表区顶部(顶栏下方) */
+#define LIST_Y  0.0f                /* 上屏不再画频道标题条，列表从顶端开始 */
 #define LIST_H  (240.0f - LIST_Y)
 static int  s_page = 1;
 /* 已知的最后一页(0 = 还不知道)。热门只有 22 页左右、收藏夹按实际条数,
  * 而接口不会提前告诉你 —— 只能翻到空页那一下才知道。记住它,是为了
  * 之后再按 R 不必再发一次注定为空的请求。换频道/换关键词要清零。 */
 static int  s_page_end = 0;
+/* 封面模块只保留 20 张 GPU 纹理。长列表用窗口映射：滚到下一批时复用
+ * 这 20 个槽，而不是按 1000 条一次性分配线性内存。 */
+static int s_thumb_base = -1;
+static int s_thumb_n = 0;
 static ListMode s_mode = MODE_RECOMMEND;   /* 默认进推荐(和官方 App 一致) */
 static int s_pending_mode = -1;   /* 登录界面里点了频道:退出后切过去 */
 static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=跟随 s_mode) */
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.4.0"
+#define APP_VERSION "1.5.0"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存全集”拿到的不是当前可视区或前
@@ -132,6 +141,8 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 static void busy_frame(const char *msg);   /* 定义在下面 */
 static int  run_bg(int (*fn)(void *), void *arg, const char *msg);  /* 同上 */
 static bool s_job_cancelled;   /* 上一次 run_bg 是否被 B 掐掉,定义在下面 */
+static void play_selected(void);
+static void page_label(const BiliPage *pg, char *out, size_t n);
 
 /* 列表加载最多试几次(含第一次)。3 次、退避 0.8s+1.6s —— 再多就该让
  * 用户自己决定了:接口真的挂了的话,机器替他干等只是把失败拖得更久。 */
@@ -153,23 +164,57 @@ static int playurl_job(void *u) {
 	return bili_get_play_url(s_job_bvid, s_job_cid, s_job_qn, s_job_url, 2048);
 }
 
+static void list_thumbs_stop(void) {
+	thumb_stop();
+	s_thumb_base = -1;
+	s_thumb_n = 0;
+}
+
+static void list_thumbs_start(int around) {
+	if (s_count <= 0 || net_is_shutting_down()) {
+		list_thumbs_stop();
+		return;
+	}
+	if (around < 0) around = 0;
+	if (around >= s_count) around = s_count - 1;
+	int base = (around / THUMB_WINDOW) * THUMB_WINDOW;
+	int n = s_count - base;
+	if (n > THUMB_WINDOW) n = THUMB_WINDOW;
+	thumb_start(&s_list[base], n);
+	s_thumb_base = base;
+	s_thumb_n = n;
+}
+
+static void list_thumbs_ensure(int first_visible) {
+	if (s_count <= 0) return;
+	if (first_visible < s_thumb_base ||
+	    first_visible >= s_thumb_base + s_thumb_n)
+		list_thumbs_start(first_visible);
+}
+
+static const C2D_Image *list_thumb_get(int index) {
+	int local = index - s_thumb_base;
+	return (local >= 0 && local < s_thumb_n) ? thumb_get(local) : NULL;
+}
+
 /* 列表拉取的实体。放到后台线程上跑,主线程照常画帧 —— 直接在主线程调
  * 会冻住整整一秒(实测接口 0.8~1.1s),那一秒和死机分不出来。 */
 static int list_fetch_job(void *unused) {
 	(void)unused;
 	switch (s_mode) {
-	case MODE_SEARCH:  return bili_search(s_keyword, s_page, s_stage, MAX_LIST, &s_stage_n);
-	case MODE_RECOMMEND: return bili_recommend(s_page, s_stage, MAX_LIST, &s_stage_n);
-	case MODE_HISTORY: return bili_history(s_page, s_stage, MAX_LIST, &s_stage_n);
-	case MODE_FAV:     return bili_fav(s_page, s_stage, MAX_LIST, &s_stage_n);
-	default:           return bili_popular(s_page, s_stage, MAX_LIST, &s_stage_n);
+	case MODE_SEARCH:  return bili_search(s_keyword, s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	case MODE_RECOMMEND: return bili_recommend(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	case MODE_HISTORY: return bili_history(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	case MODE_FAV:     return bili_fav(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	default:           return bili_popular(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	}
 }
 
 static void load_list(void) {
+	bool append = s_page > 1 && s_count > 0;
 	if (!s_net_ok) {
-		s_count = 0;
-		set_status("网络未就绪(A 重试 / 可打开缓存列表)",
+		if (!append) s_count = 0;
+		set_status("网络未就绪(A 重试 / 可打开离线下载任务)",
 		           "network unavailable; A=retry");
 		snprintf(s_busy, sizeof(s_busy), "网络初始化失败，离线缓存仍可播放");
 		return;
@@ -193,7 +238,7 @@ static void load_list(void) {
 	 * 而「图片请求不与 API 请求同时在飞」正是下面放开图片并发的前提。
 	 * 这个不变式靠调用顺序保证,比靠一把全局大锁便宜得多。
 	 * 放在画帧**之后**:这样那一帧里封面还在,不会先闪掉一排图。 */
-	thumb_stop();
+	list_thumbs_stop();
 
 	/* 【自动重试】列表接口偶发失败是常态:3DS 的 httpc 本就脆,
 	 * B 站对掌机 UA 也时不时风控性地拒一次。这种失败重来一次多半就好了,
@@ -238,14 +283,36 @@ static void load_list(void) {
 		s_page_end = s_page;      /* 记下来,下次 R 直接挡掉 */
 		set_status("", "no more pages");
 		snprintf(s_busy, sizeof(s_busy), "已经是最后一页");
-		if (s_count > 0) thumb_start(s_list, s_count);
+		if (s_count > 0) list_thumbs_start(s_sel);
 		return;
 	}
 	if (r == 0) {
-		memcpy(s_list, s_stage, sizeof(s_list));
-		s_count = s_stage_n;
+		if (append) {
+			int added = 0;
+			for (int j = 0; j < s_stage_n && s_count < MAX_LIST; j++) {
+				bool duplicate = false;
+				for (int i = 0; i < s_count; i++) {
+					if (!strcmp(s_list[i].bvid, s_stage[j].bvid)) {
+						duplicate = true;
+						break;
+					}
+				}
+				if (!duplicate) {
+					s_list[s_count++] = s_stage[j];
+					added++;
+				}
+			}
+			if (!added || s_count >= MAX_LIST) {
+				s_page_end = s_page;
+				if (s_count >= MAX_LIST)
+					snprintf(s_busy, sizeof(s_busy), "列表已达到本机安全上限");
+			}
+		} else {
+			memcpy(s_list, s_stage, (size_t)s_stage_n * sizeof(s_stage[0]));
+			s_count = s_stage_n;
+		}
 	}
-	if (r == 0 || !s_job_cancelled) {
+	if (!append && (r == 0 || !s_job_cancelled)) {
 		/* 取消时连滚动位置一起留着 —— 那才叫"当无事发生" */
 		s_sel = 0;
 		s_scroll = 0.0f;
@@ -256,7 +323,8 @@ static void load_list(void) {
 		set_status("", "load cancelled");
 		s_busy[0] = 0;
 	} else if (r != 0) {
-		s_count = 0;
+		if (append && s_page > 1) s_page--;  /* 下次仍重试同一页，不跳号 */
+		if (!append) s_count = 0;
 		char sbuf[160];
 		snprintf(sbuf, sizeof(sbuf), "加载失败 %s(A 重试 / B 返回)",
 		         bili_last_error());
@@ -266,10 +334,14 @@ static void load_list(void) {
 		char buf[64];
 		snprintf(buf, sizeof(buf), "loaded page %d, %d items", s_page, s_count);
 		set_status("", buf);
-		s_busy[0] = 0;      /* 加载成功:清掉上次的失败原因 */
+		if (append && s_page_end && s_page >= s_page_end) {
+			if (!s_busy[0]) snprintf(s_busy, sizeof(s_busy), "没有更多新内容");
+		} else {
+			s_busy[0] = 0;  /* 加载成功:清掉上次的失败原因 */
+		}
 	}
 	if (s_count > 0)
-		thumb_start(s_list, s_count);
+		list_thumbs_start(s_sel);
 }
 
 static void fmt_meta(const BiliVideo *v, char *out, size_t n) {
@@ -309,7 +381,7 @@ static void draw_list(void) {
 			if (y > 240) break;
 			if (i == s_sel)
 				ui_rect_z(0, y, 0.15f, 400, ROW_H - 4, UI_COL_SEL);
-			const C2D_Image *im = thumb_get(i);
+			const C2D_Image *im = list_thumb_get(i);
 			if (im) {
 				C2D_DrawImageAt(*im, 6, y + 2, 0.2f, NULL, 1.0f, 1.0f);
 			} else {
@@ -366,35 +438,11 @@ static void draw_list(void) {
 	if (s_count == 0)
 		ui_text(120, 110, UI_SHARP, UI_COL_DIM, s_status);
 
-	/* 顶栏:z 抬到行文字(0.5)之上才能真正遮住上浮的行 */
-	ui_rect_z(0, 0, 0.6f, 400, 26, UI_COL_ACCENT);
-	char title[160];
-	switch (s_mode) {
-	case MODE_SEARCH:
-		snprintf(title, sizeof(title), "搜索: %s  P%d", s_keyword, s_page);
-		break;
-	case MODE_RECOMMEND:
-		snprintf(title, sizeof(title), "为你推荐");
-		break;
-	case MODE_HISTORY:
-		snprintf(title, sizeof(title), "历史记录  P%d", s_page);
-		break;
-	case MODE_FAV:
-		snprintf(title, sizeof(title), "默认收藏夹  P%d", s_page);
-		break;
-	default:
-		snprintf(title, sizeof(title), "热门  P%d", s_page);
-		break;
-	}
-	ui_text_clipped_z(6, 3, 0.7f, UI_SHARP, UI_COL_WHITE, title, 300);
-	const char *user = bili_username();
-	ui_text_clipped_z(302, 3, 0.7f, UI_SHARP, UI_COL_WHITE,
-	                  user ? user : "未登录", 95);
 }
 
 typedef struct {
 	bool login, settings, hist, fav, popular, recommend, search;
-	bool cache, cache_all, cache_list;
+	bool cache, parts, downloads;
 } ListActions;
 
 static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act) {
@@ -461,12 +509,12 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 	if (ui_button(112, 112, 96, 36, "缓存当前", UI_COL_SEL,
 	              touched, tx, ty))
 		act->cache = true;
-	if (ui_button(214, 112, 96, 36, "缓存列表", UI_COL_SEL,
+	if (ui_button(214, 112, 96, 36, "查看选集", UI_COL_SEL,
 	              touched, tx, ty))
-		act->cache_list = true;
-	if (ui_button(10, 154, 300, 36, "一键缓存完整选集", UI_COL_SEL,
+		act->parts = true;
+	if (ui_button(10, 154, 300, 36, "离线下载任务", UI_COL_SEL,
 	              touched, tx, ty))
-		act->cache_all = true;
+		act->downloads = true;
 }
 
 /* ---------- 设置页 ----------
@@ -563,11 +611,43 @@ static void do_search(void) {
 	}
 }
 
+static bool confirm_logout(void) {
+	while (aptMainLoop()) {
+		hidScanInput();
+		u32 kd = hidKeysDown();
+		touchPosition tp = { 0, 0 };
+		bool touched = (kd & KEY_TOUCH) != 0;
+		if (touched) hidTouchRead(&tp);
+
+		ui_begin();
+		ui_rect(38, 68, 324, 104, C2D_Color32(0x20, 0x20, 0x2A, 0xF4));
+		ui_text(118, 88, UI_SHARP, UI_COL_WHITE, "确认退出登录？");
+		ui_text(84, 128, 0.65f, UI_COL_DIM,
+		        "退出后历史、收藏等账号功能将不可用");
+		ui_begin_bottom();
+		ui_text(84, 52, UI_SHARP, UI_COL_TEXT, "是否注销当前 bilibili 账号");
+		bool yes = ui_button(20, 112, 132, 46, "确认注销", UI_COL_ACCENT,
+		                     touched, tp.px, tp.py);
+		bool no = ui_button(168, 112, 132, 46, "取消", UI_COL_SEL,
+		                    touched, tp.px, tp.py);
+		ui_text(73, 188, 0.65f, UI_COL_DIM, "A 确认   B 取消");
+		ui_end();
+
+		if (yes || (kd & KEY_A)) return true;
+		if (no || (kd & KEY_B)) return false;
+	}
+	return false;
+}
+
 static void do_login(void) {
 	if (!s_net_ok) { load_list(); return; }
 	if (bili_logged_in()) {
-		bili_logout();
-		set_status("已注销", "logged out");
+		if (confirm_logout()) {
+			bili_logout();
+			set_status("已注销", "logged out");
+		} else {
+			set_status("已取消注销", "logout cancelled");
+		}
 		return;
 	}
 
@@ -794,10 +874,10 @@ static void cache_duplicate_message(const char *bvid, int64_t cid,
 		snprintf(out, outlen, "该视频已在待缓存队列");
 		break;
 	case DOWNLOAD_STATUS_PAUSED:
-		snprintf(out, outlen, "该视频已有暂停任务，请到缓存列表继续");
+		snprintf(out, outlen, "该视频已有暂停任务，请到离线下载任务继续");
 		break;
 	case DOWNLOAD_STATUS_FAILED:
-		snprintf(out, outlen, "该视频已有失败任务，请到缓存列表重试");
+		snprintf(out, outlen, "该视频已有失败任务，请到离线下载任务重试");
 		break;
 	default:
 		snprintf(out, outlen, "该视频已有缓存任务，不会重复加入");
@@ -899,50 +979,20 @@ static void cache_selected(void) {
 	}
 	if (s_sel < 0 || s_sel >= s_count) return;
 	BiliVideo *v = &s_list[s_sel];
-	thumb_stop();
+	list_thumbs_stop();
 	if (!v->cid) {
 		set_status("获取视频信息...", "cache: fetching cid");
 		busy_frame("获取视频信息");
 		if (bili_get_cid(v->bvid, &v->cid, &v->aid) != 0) {
 			snprintf(s_busy, sizeof(s_busy), "无法缓存:%s", bili_last_error());
-			if (!net_is_shutting_down()) thumb_start(s_list, s_count);
+			if (!net_is_shutting_down()) list_thumbs_start(s_sel);
 			return;
 		}
 	}
 	int r = cache_manager_enqueue(v->bvid, v->cid, v->aid, v->title,
 	                              v->author, g_qn);
 	cache_enqueue_message(v->bvid, v->cid, r, s_busy, sizeof(s_busy));
-	if (!net_is_shutting_down()) thumb_start(s_list, s_count);
-}
-
-static void cache_all_selected(void) {
-	if (!s_net_ok) { load_list(); return; }
-	if (!s_cache_ok) {
-		snprintf(s_busy, sizeof(s_busy), "缓存目录/数据库不可写");
-		return;
-	}
-	if (s_sel < 0 || s_sel >= s_count) return;
-	BiliVideo *v = &s_list[s_sel];
-	thumb_stop();
-	if (!v->cid && bili_get_cid(v->bvid, &v->cid, &v->aid) != 0) {
-		snprintf(s_busy, sizeof(s_busy), "无法缓存:%s", bili_last_error());
-		if (!net_is_shutting_down()) thumb_start(s_list, s_count);
-		return;
-	}
-
-	s_npages = 0;
-	if (v->pages != 1) {
-		s_job_bvid = v->bvid;
-		if (run_bg(pagelist_job, NULL, "读取完整选集") != 0) {
-			snprintf(s_busy, sizeof(s_busy), "无法读取完整选集:%s",
-			         bili_last_error());
-			if (!net_is_shutting_down()) thumb_start(s_list, s_count);
-			return;
-		}
-		if (s_npages > 0) v->pages = s_npages;
-	}
-	cache_all_video_parts(v, g_qn, s_busy, sizeof(s_busy));
-	if (!net_is_shutting_down()) thumb_start(s_list, s_count);
+	if (!net_is_shutting_down()) list_thumbs_start(s_sel);
 }
 
 static void draw_cache_page(int sel, const char *notice) {
@@ -1060,6 +1110,101 @@ static void cache_list_page(void) {
 	}
 }
 
+/* 主页“查看选集”：先把真实 pagelist 展示出来，再允许缓存全集。
+ * 这样“缓存完整列表”只在用户已经看见会加入哪些条目之后出现，避免主页
+ * 一个没有上下文的大按钮把几十、几百条任务直接塞进队列。 */
+static void parts_page(void) {
+	if (!s_net_ok || s_sel < 0 || s_sel >= s_count) return;
+	BiliVideo *v = &s_list[s_sel];
+	list_thumbs_stop();
+	s_npages = 0;
+	s_job_bvid = v->bvid;
+	if (run_bg(pagelist_job, NULL, "读取选集") != 0 || s_npages <= 0) {
+		snprintf(s_busy, sizeof(s_busy), "读取选集失败:%s", bili_last_error());
+		list_thumbs_start(s_sel);
+		return;
+	}
+	v->pages = s_npages;
+	for (int i = 0; i < s_npages; i++) {
+		page_label(&s_pages[i], s_pg_label[i], sizeof(s_pg_label[i]));
+		s_pg_labelp[i] = s_pg_label[i];
+		s_pg_dur[i] = s_pages[i].duration;
+	}
+
+	int sel = 0;
+	for (int i = 0; i < s_npages; i++)
+		if (s_pages[i].cid == v->cid) { sel = i; break; }
+	char notice[128] = "";
+	while (aptMainLoop()) {
+		hidScanInput();
+		u32 kd = hidKeysDown();
+		touchPosition tp = { 0, 0 };
+		bool touched = (kd & KEY_TOUCH) != 0;
+		if (touched) hidTouchRead(&tp);
+		if ((kd & KEY_UP) && sel > 0) sel--;
+		if ((kd & KEY_DOWN) && sel + 1 < s_npages) sel++;
+
+		ui_begin();
+		int first = sel - 3;
+		if (first < 0) first = 0;
+		if (first > s_npages - 7) first = s_npages - 7;
+		if (first < 0) first = 0;
+		for (int i = first; i < s_npages && i < first + 7; i++) {
+			float y = 4.0f + (float)(i - first) * 33.0f;
+			if (i == sel) ui_rect_z(0, y, 0.15f, 400, 31, UI_COL_SEL);
+			ui_text_clipped(8, y + 5, UI_SHARP,
+			                i == sel ? UI_COL_WHITE : UI_COL_TEXT,
+			                s_pg_label[i], 326);
+			if (s_pg_dur[i] > 0) {
+				char db[16];
+				snprintf(db, sizeof(db), "%d:%02d",
+				         s_pg_dur[i] / 60, s_pg_dur[i] % 60);
+				ui_text(344, y + 5, 0.65f, UI_COL_DIM, db);
+			}
+		}
+
+		ui_begin_bottom();
+		ui_text_clipped(10, 6, UI_SHARP, UI_COL_TEXT, v->title, 300);
+		bool all = ui_button(10, 38, 300, 40, "缓存完整列表", UI_COL_ACCENT,
+		                     touched, tp.px, tp.py);
+		bool play = ui_button(10, 86, 145, 40, "播放本集", UI_COL_SEL,
+		                      touched, tp.px, tp.py);
+		bool one = ui_button(165, 86, 145, 40, "缓存本集", UI_COL_SEL,
+		                     touched, tp.px, tp.py);
+		bool tasks = ui_button(10, 134, 145, 40, "下载任务", UI_COL_SEL,
+		                       touched, tp.px, tp.py);
+		bool back = ui_button(165, 134, 145, 40, "返回", UI_COL_SEL,
+		                      touched, tp.px, tp.py);
+		ui_rect(10, 184, 300, 46, C2D_Color32(0x26, 0x26, 0x30, 0xFF));
+		ui_text_clipped(18, 194, 0.62f, UI_COL_DIM,
+		                notice[0] ? notice : "↑↓选择  A播放  B返回", 284);
+		ui_end();
+
+		if (back || (kd & KEY_B)) break;
+		if (all) {
+			cache_all_video_parts(v, g_qn, notice, sizeof(notice));
+		}
+		if (one) {
+			char title[200];
+			cache_part_title(v, &s_pages[sel], title, sizeof(title));
+			int r = cache_manager_enqueue(v->bvid, s_pages[sel].cid, v->aid,
+			                              title, v->author, g_qn);
+			cache_enqueue_message(v->bvid, s_pages[sel].cid, r,
+			                      notice, sizeof(notice));
+		}
+		if (tasks) cache_list_page();
+		if (play || (kd & KEY_A)) {
+			v->cid = s_pages[sel].cid;
+			play_selected();
+			/* 播放器返回时会恢复列表封面；选集页不画封面，先停掉，
+			 * 避免它和这里的缓存/任务操作并发请求。 */
+			list_thumbs_stop();
+		}
+		if (net_is_shutting_down() || aptShouldClose()) break;
+	}
+	if (!net_is_shutting_down()) list_thumbs_start(s_sel);
+}
+
 /* 分P 一行的显示文本:"P3  标题"(没标题就只有 "P3") */
 static void page_label(const BiliPage *pg, char *out, size_t n) {
 	if (pg->title[0]) snprintf(out, n, "P%d  %s", pg->page, pg->title);
@@ -1166,7 +1311,7 @@ static void play_selected(void) {
 	 * 3DS httpc 在这种压力下会把响应张冠李戴 —— 实测症状就是
 	 * "第一次进某视频字幕是别的视频的,退出等一会儿再进就正常"
 	 * (等的那会儿封面刚好下完,并发消失) */
-	thumb_stop();
+	list_thumbs_stop();
 
 	if (v->cid == 0) {
 		set_status("获取视频信息...", "fetching cid...");
@@ -1255,7 +1400,7 @@ static void play_selected(void) {
 	/* 【系统正在关我们时别再启动封面下载】否则刚被掐掉的两个 loader 线程
 	 * 立刻又被拉起来,接着 thumb_exit 还得把它们收一遍 —— 白白拖长
 	 * "Closing software"。 */
-	if (s_count > 0 && !net_is_shutting_down()) thumb_start(s_list, s_count);
+	if (s_count > 0 && !net_is_shutting_down()) list_thumbs_start(s_sel);
 	ui_trace_sync("exit-path: play_video done");
 }
 
@@ -1432,6 +1577,23 @@ int main(void) {
 			s_scroll += (s_scroll_t - s_scroll) * 0.35f;
 			if (s_scroll - s_scroll_t < 0.5f && s_scroll_t - s_scroll < 0.5f)
 				s_scroll = s_scroll_t;
+
+			int first_visible = (int)(s_scroll_t / ROW_H);
+			if (first_visible < 0) first_visible = 0;
+			if (!s_in_settings) list_thumbs_ensure(first_visible);
+
+			/* 推荐/热门/历史改为连续流：视口接近尾部就追加下一页，
+			 * 原有条目、选中项和滚动位置全部保留。 */
+			bool endless = s_mode == MODE_RECOMMEND ||
+			               s_mode == MODE_POPULAR || s_mode == MODE_HISTORY;
+			int last_visible = (int)((s_scroll_t + LIST_H) / ROW_H);
+			if (!s_in_settings && !(kDown & KEY_R) && endless &&
+			    s_count > 0 && s_count < MAX_LIST &&
+			    (!s_page_end || s_page < s_page_end) &&
+			    last_visible >= s_count - 3) {
+				s_page++;
+				load_list();
+			}
 		}
 		if (kDown & KEY_R) {
 			if (s_page_end && s_page >= s_page_end) {
@@ -1443,7 +1605,13 @@ int main(void) {
 				load_list();
 			}
 		}
-		if (kDown & KEY_L && s_page > 1) { s_page--; load_list(); }
+		if (kDown & KEY_L) {
+			/* 连续列表不再“返回上一页并覆盖内容”；L 改为向上翻一屏。 */
+			s_scroll_t -= LIST_H;
+			if (s_scroll_t < 0) s_scroll_t = 0;
+			int firstv = (int)(s_scroll_t / ROW_H);
+			if (s_sel > firstv) s_sel = firstv;
+		}
 		if ((kDown & (KEY_ZL | KEY_ZR)) ||
 		    ((kDown & KEY_SELECT) && !(hidKeysHeld() & KEY_START))) {
 			/* 频道循环只含 热门↔推荐;历史/收藏走下屏独立按钮。
@@ -1546,11 +1714,11 @@ int main(void) {
 		if (act.search) do_search();
 		if (act.settings) { s_in_settings = true; ui_list_reset(); }
 		if (act.cache) cache_selected();
-		if (act.cache_all) cache_all_selected();
-		if (act.cache_list) {
-			thumb_stop();
+		if (act.parts) parts_page();
+		if (act.downloads) {
+			list_thumbs_stop();
 			cache_list_page();
-			if (!net_is_shutting_down() && s_count > 0) thumb_start(s_list, s_count);
+			if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
 		}
 		if (act.popular) {
 			s_hl_mode = -1;
