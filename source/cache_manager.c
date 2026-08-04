@@ -74,8 +74,8 @@ static int utf8_len(unsigned char c) {
 
 static bool reserved_name(const char *s) {
 	char up[8] = {0};
-	/* FAT/Windows 把 CON.txt、COM1.mp4 也视为保留名，判断的是第一个点
-	 * 之前的主文件名，而不只是完整组件。 */
+	/* FAT/Windows ??CON.txt??OM1.mp4 ???????????????????????
+	 * ??????????????????????????*/
 	size_t n = strcspn(s, ".");
 	if (n >= sizeof(up)) return false;
 	for (size_t i = 0; i < n; i++) up[i] = (char)toupper((unsigned char)s[i]);
@@ -86,7 +86,7 @@ static bool reserved_name(const char *s) {
 	return false;
 }
 
-/* 保留 UTF-8 标题，只清理 FAT 路径中不合法/危险的 ASCII 字符。 */
+/* ??? UTF-8 ????????? FAT ?????????/?????ASCII ?????*/
 static void safe_component(const char *src, char *dst, size_t cap,
                            const char *fallback) {
 	if (!cap) return;
@@ -133,6 +133,12 @@ static bool valid_bvid(const char *s) {
 
 static int find_locked(const DownloadTask *key) {
 	for (int i = 0; i < s_count; i++) if (key_eq(&s_tasks[i], key)) return i;
+	return -1;
+}
+
+static int find_media_locked(const char *bvid, int64_t cid) {
+	for (int i = 0; i < s_count; i++)
+		if (s_tasks[i].cid == cid && !strcmp(s_tasks[i].bvid, bvid)) return i;
 	return -1;
 }
 
@@ -241,15 +247,15 @@ static int load_file(const char *path, DownloadTask *out, int *count,
 
 static void canonicalize_loaded(DownloadTask *t) {
 	char author[80], title[192], want[CACHE_PATH_MAX], collision_path[CACHE_PATH_MAX];
-	safe_component(t->author, author, sizeof(author), "未知UP主");
-	safe_component(t->title, title, sizeof(title), "未命名视频");
+	safe_component(t->author, author, sizeof(author), "???UP??);
+	safe_component(t->title, title, sizeof(title), "????????);
 	snprintf(want, sizeof(want), "%s/%s/%s.mp4", CACHE_VIDEO_DIR, author, title);
 	char cidbuf[24];
 	u64_dec((uint64_t)t->cid, cidbuf, sizeof(cidbuf));
 	snprintf(collision_path, sizeof(collision_path), "%s/%s/%s [%s-%s-%d].mp4",
 	         CACHE_VIDEO_DIR, author, title, t->bvid, cidbuf, t->qn);
-	/* 旧数据库或损坏路径不能决定我们会读写/删除哪里。只有规范根目录下的
-	 * 路径可保留；否则按元数据重建。 */
+	/* ???????????????????????????/?????????????????????
+	 * ???????????????????????*/
 	bool exact = !strcmp(t->filepath, want);
 	bool collision = !strcmp(t->filepath, collision_path);
 	if ((!exact && !collision) || strstr(t->filepath, "..") ||
@@ -331,45 +337,88 @@ static bool path_taken_locked(const char *path) {
 	return file_exists(path, NULL) || file_exists(part, NULL);
 }
 
-int cache_manager_enqueue(const char *bvid, int64_t cid, int64_t aid,
-                          const char *title, const char *author, int qn) {
+static int append_locked(const char *bvid, int64_t cid, int64_t aid,
+                         const char *title, const char *author, int qn) {
 	if (!s_ready || !valid_bvid(bvid) || cid <= 0 ||
 	    (qn != 16 && qn != 32)) return -1;
 	DownloadTask t;
 	memset(&t, 0, sizeof(t));
 	snprintf(t.bvid, sizeof(t.bvid), "%s", bvid);
 	t.cid = cid; t.aid = aid; t.qn = qn;
-	snprintf(t.title, sizeof(t.title), "%s", title && title[0] ? title : "未命名视频");
-	snprintf(t.author, sizeof(t.author), "%s", author && author[0] ? author : "未知UP主");
+	snprintf(t.title, sizeof(t.title), "%s", title && title[0] ? title : "????????);
+	snprintf(t.author, sizeof(t.author), "%s", author && author[0] ? author : "???UP??);
 	t.status = DOWNLOAD_STATUS_WAITING;
 	t.created_time = (int64_t)time(NULL);
 
-	LightLock_Lock(&s_lock);
-	if (find_locked(&t) >= 0) { LightLock_Unlock(&s_lock); return 1; }
-	if (s_count >= CACHE_MAX_TASKS) { LightLock_Unlock(&s_lock); return -2; }
+	if (find_media_locked(t.bvid, t.cid) >= 0) return 1;
+	if (s_count >= CACHE_MAX_TASKS) return -2;
 	char safe_author[80], safe_title[192], dir[CACHE_PATH_MAX];
-	safe_component(t.author, safe_author, sizeof(safe_author), "未知UP主");
-	safe_component(t.title, safe_title, sizeof(safe_title), "未命名视频");
+	safe_component(t.author, safe_author, sizeof(safe_author), "???UP??);
+	safe_component(t.title, safe_title, sizeof(safe_title), "????????);
 	snprintf(dir, sizeof(dir), "%s/%s", CACHE_VIDEO_DIR, safe_author);
-	if (!ensure_dir(dir)) { LightLock_Unlock(&s_lock); return -3; }
+	if (!ensure_dir(dir)) return -3;
 	snprintf(t.filepath, sizeof(t.filepath), "%s/%s.mp4", dir, safe_title);
 	if (path_taken_locked(t.filepath)) {
 		char cidbuf[24];
 		u64_dec((uint64_t)t.cid, cidbuf, sizeof(cidbuf));
 		snprintf(t.filepath, sizeof(t.filepath), "%s/%s [%s-%s-%d].mp4", dir,
 		         safe_title, t.bvid, cidbuf, t.qn);
-		/* 数据库外的孤立文件不自动认领或覆盖。确定性后缀仍冲突时，
-		 * 让用户处理该文件比猜测它属于谁安全。 */
+		/* ????????????????????????????????????????????		 * ????????????????????????????*/
 		if (path_taken_locked(t.filepath)) {
-			LightLock_Unlock(&s_lock);
 			return -4;
 		}
 	}
 	s_tasks[s_count++] = t;
-	int r = save_locked();
-	if (r != 0) s_count--;   /* UI 收到失败时，内存里也不能偷偷留下任务 */
+	return 0;
+}
+
+int cache_manager_enqueue(const char *bvid, int64_t cid, int64_t aid,
+                          const char *title, const char *author, int qn) {
+	LightLock_Lock(&s_lock);
+	int old_count = s_count;
+	int r = append_locked(bvid, cid, aid, title, author, qn);
+	if (r == 0 && save_locked() != 0) {
+		s_count = old_count;
+		r = -3;
+	}
 	LightLock_Unlock(&s_lock);
-	return r == 0 ? 0 : -3;
+	return r;
+}
+
+int cache_manager_enqueue_batch(const CacheEnqueueItem *items, int count,
+                                int *added, int *duplicates) {
+	if (added) *added = 0;
+	if (duplicates) *duplicates = 0;
+	if (!items || count <= 0) return -1;
+
+	LightLock_Lock(&s_lock);
+	int old_count = s_count;
+	int add_n = 0, dup_n = 0, first_error = 0;
+	for (int i = 0; i < count; i++) {
+		int r = append_locked(items[i].bvid, items[i].cid, items[i].aid,
+		                      items[i].title, items[i].author, items[i].qn);
+		if (r == 0) add_n++;
+		else if (r == 1) dup_n++;
+		else if (!first_error) first_error = r;
+	}
+	if (add_n && save_locked() != 0) {
+		s_count = old_count;
+		add_n = 0;
+		first_error = -3;
+	}
+	LightLock_Unlock(&s_lock);
+	if (added) *added = add_n;
+	if (duplicates) *duplicates = dup_n;
+	return first_error;
+}
+
+int cache_manager_find(const char *bvid, int64_t cid, DownloadTask *out) {
+	if (!bvid || !bvid[0] || cid <= 0) return -1;
+	LightLock_Lock(&s_lock);
+	int i = find_media_locked(bvid, cid);
+	if (i >= 0 && out) *out = s_tasks[i];
+	LightLock_Unlock(&s_lock);
+	return i >= 0 ? 0 : -1;
 }
 
 int cache_manager_count(void) {
@@ -494,11 +543,11 @@ int cache_manager_mark_completed(const DownloadTask *t, uint64_t size) {
 
 const char *cache_manager_status_name(DownloadStatus s) {
 	switch (s) {
-	case DOWNLOAD_STATUS_WAITING: return "等待中";
-	case DOWNLOAD_STATUS_DOWNLOADING: return "下载中";
-	case DOWNLOAD_STATUS_PAUSED: return "已暂停";
-	case DOWNLOAD_STATUS_FAILED: return "失败";
-	case DOWNLOAD_STATUS_COMPLETED: return "已完成";
-	default: return "未知";
+	case DOWNLOAD_STATUS_WAITING: return "?????;
+	case DOWNLOAD_STATUS_DOWNLOADING: return "?????;
+	case DOWNLOAD_STATUS_PAUSED: return "?????;
+	case DOWNLOAD_STATUS_FAILED: return "???";
+	case DOWNLOAD_STATUS_COMPLETED: return "?????;
+	default: return "???";
 	}
 }
