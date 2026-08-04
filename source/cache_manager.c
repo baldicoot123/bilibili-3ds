@@ -74,8 +74,8 @@ static int utf8_len(unsigned char c) {
 
 static bool reserved_name(const char *s) {
 	char up[8] = {0};
-	/* FAT/Windows ??CON.txt??OM1.mp4 ???????????????????????
-	 * ??????????????????????????*/
+	/* FAT/Windows 把 CON.txt、COM1.mp4 也视为保留名，判断的是第一个点
+	 * 之前的主文件名，而不只是完整组件。 */
 	size_t n = strcspn(s, ".");
 	if (n >= sizeof(up)) return false;
 	for (size_t i = 0; i < n; i++) up[i] = (char)toupper((unsigned char)s[i]);
@@ -86,7 +86,7 @@ static bool reserved_name(const char *s) {
 	return false;
 }
 
-/* ??? UTF-8 ????????? FAT ?????????/?????ASCII ?????*/
+/* 保留 UTF-8 标题，只清理 FAT 路径中不合法/危险的 ASCII 字符。 */
 static void safe_component(const char *src, char *dst, size_t cap,
                            const char *fallback) {
 	if (!cap) return;
@@ -247,15 +247,15 @@ static int load_file(const char *path, DownloadTask *out, int *count,
 
 static void canonicalize_loaded(DownloadTask *t) {
 	char author[80], title[192], want[CACHE_PATH_MAX], collision_path[CACHE_PATH_MAX];
-	safe_component(t->author, author, sizeof(author), "???UP??);
-	safe_component(t->title, title, sizeof(title), "????????);
+	safe_component(t->author, author, sizeof(author), "未知UP主");
+	safe_component(t->title, title, sizeof(title), "未命名视频");
 	snprintf(want, sizeof(want), "%s/%s/%s.mp4", CACHE_VIDEO_DIR, author, title);
 	char cidbuf[24];
 	u64_dec((uint64_t)t->cid, cidbuf, sizeof(cidbuf));
 	snprintf(collision_path, sizeof(collision_path), "%s/%s/%s [%s-%s-%d].mp4",
 	         CACHE_VIDEO_DIR, author, title, t->bvid, cidbuf, t->qn);
-	/* ???????????????????????????/?????????????????????
-	 * ???????????????????????*/
+	/* 旧数据库或损坏路径不能决定我们会读写/删除哪里。只有规范根目录下的
+	 * 路径可保留；否则按元数据重建。 */
 	bool exact = !strcmp(t->filepath, want);
 	bool collision = !strcmp(t->filepath, collision_path);
 	if ((!exact && !collision) || strstr(t->filepath, "..") ||
@@ -345,16 +345,16 @@ static int append_locked(const char *bvid, int64_t cid, int64_t aid,
 	memset(&t, 0, sizeof(t));
 	snprintf(t.bvid, sizeof(t.bvid), "%s", bvid);
 	t.cid = cid; t.aid = aid; t.qn = qn;
-	snprintf(t.title, sizeof(t.title), "%s", title && title[0] ? title : "????????);
-	snprintf(t.author, sizeof(t.author), "%s", author && author[0] ? author : "???UP??);
+	snprintf(t.title, sizeof(t.title), "%s", title && title[0] ? title : "未命名视频");
+	snprintf(t.author, sizeof(t.author), "%s", author && author[0] ? author : "未知UP主");
 	t.status = DOWNLOAD_STATUS_WAITING;
 	t.created_time = (int64_t)time(NULL);
 
 	if (find_media_locked(t.bvid, t.cid) >= 0) return 1;
 	if (s_count >= CACHE_MAX_TASKS) return -2;
 	char safe_author[80], safe_title[192], dir[CACHE_PATH_MAX];
-	safe_component(t.author, safe_author, sizeof(safe_author), "???UP??);
-	safe_component(t.title, safe_title, sizeof(safe_title), "????????);
+	safe_component(t.author, safe_author, sizeof(safe_author), "未知UP主");
+	safe_component(t.title, safe_title, sizeof(safe_title), "未命名视频");
 	snprintf(dir, sizeof(dir), "%s/%s", CACHE_VIDEO_DIR, safe_author);
 	if (!ensure_dir(dir)) return -3;
 	snprintf(t.filepath, sizeof(t.filepath), "%s/%s.mp4", dir, safe_title);
@@ -363,7 +363,8 @@ static int append_locked(const char *bvid, int64_t cid, int64_t aid,
 		u64_dec((uint64_t)t.cid, cidbuf, sizeof(cidbuf));
 		snprintf(t.filepath, sizeof(t.filepath), "%s/%s [%s-%s-%d].mp4", dir,
 		         safe_title, t.bvid, cidbuf, t.qn);
-		/* ????????????????????????????????????????????		 * ????????????????????????????*/
+		/* 数据库外的孤立文件不自动认领或覆盖。确定性后缀仍冲突时，
+		 * 让用户处理该文件比猜测它属于谁安全。 */
 		if (path_taken_locked(t.filepath)) {
 			return -4;
 		}
@@ -543,11 +544,11 @@ int cache_manager_mark_completed(const DownloadTask *t, uint64_t size) {
 
 const char *cache_manager_status_name(DownloadStatus s) {
 	switch (s) {
-	case DOWNLOAD_STATUS_WAITING: return "?????;
-	case DOWNLOAD_STATUS_DOWNLOADING: return "?????;
-	case DOWNLOAD_STATUS_PAUSED: return "?????;
-	case DOWNLOAD_STATUS_FAILED: return "???";
-	case DOWNLOAD_STATUS_COMPLETED: return "?????;
-	default: return "???";
+	case DOWNLOAD_STATUS_WAITING: return "等待中";
+	case DOWNLOAD_STATUS_DOWNLOADING: return "下载中";
+	case DOWNLOAD_STATUS_PAUSED: return "已暂停";
+	case DOWNLOAD_STATUS_FAILED: return "失败";
+	case DOWNLOAD_STATUS_COMPLETED: return "已完成";
+	default: return "未知";
 	}
 }
