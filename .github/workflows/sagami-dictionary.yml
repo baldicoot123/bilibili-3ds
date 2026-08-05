@@ -53,6 +53,7 @@ jobs:
 
       - name: Create patch from original v0.1.0 CIA
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git worktree add --detach /tmp/sagami-original 2d9f4d40ee30a3bb860cdaed140fc88ebbcd3272
           make -C /tmp/sagami-original/SAGAMI-Dictionary -j2 cia
           bsdiff \
