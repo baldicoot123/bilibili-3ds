@@ -1,0 +1,11 @@
+build/
+__pycache__/
+tools/__pycache__/
+*.3dsx
+*.elf
+*.lst
+*.map
+*.smdh
+*.cia
+data/*.jsonl
+data/dict-test-output/

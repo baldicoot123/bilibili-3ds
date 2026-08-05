@@ -1,0 +1,82 @@
+BasicInfo:
+  Title: "Sagami Dictionary"
+  ProductCode: "CTR-P-SGMD"
+  Logo: Homebrew
+RomFs:
+  RootPath: "$(APP_ROMFS)"
+TitleInfo:
+  Category: Application
+  UniqueId: 0x53444
+Option:
+  UseOnSD: true
+  EnableCompress: true
+  EnableCrypt: false
+  FreeProductCode: true
+AccessControlInfo:
+  CoreVersion: 2
+  DescVersion: 2
+  IdealProcessor: 0
+  AffinityMask: 3
+  Priority: 48
+  MaxCpu: 0x9E
+  DisableDebug: false
+  EnableForceDebug: false
+  CanWriteSharedPage: false
+  CanUsePrivilegedPriority: false
+  CanUseNonAlphabetAndNumber: true
+  PermitMainFunctionArgument: false
+  CanShareDeviceMemory: false
+  RunnableOnSleep: false
+  SpecialMemoryArrange: false
+  SystemMode: 64MB
+  SystemModeExt: 124MB
+  CpuSpeed: 804MHz
+  EnableL2Cache: true
+  CanAccessCore2: true
+  MemoryType: Application
+  HandleTableSize: 0x200
+  IORegisterMapping: []
+  MemoryMapping: []
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    CreateThread: 8
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetCurrentProcessorNumber: 17
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateEvent: 26
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    GetSystemTick: 40
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    ConnectToPort: 45
+  ServiceAccessControl:
+    - APT:U
+    - ac:u
+    - am:net
+    - boss:U
+    - cam:u
+    - cfg:u
+    - csnd:SND
+    - dsp::DSP
+    - fs:USER
+    - gsp::Gpu
+    - hid:USER
+    - ir:USER
+    - mic:u
+    - ndm:u
+    - news:u
+    - nwm::UDS
+    - ptm:u
+    - soc:U
+    - ssl:C
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
