@@ -48,6 +48,10 @@ void player_set_login_cb(bool (*cb)(void));
 typedef int (*PlayerCacheCallback)(bool all_parts, char *message, size_t message_len);
 void player_set_cache_cb(PlayerCacheCallback cb);
 
+/* 播放控制页点“查看合集”时，播放器先安全退出当前流；main.c 取走请求后
+ * 再读取跨稿件 UGC 合集，避免把 B 站接口逻辑塞进 FFmpeg 播放管线。 */
+bool player_take_collection_request(void);
+
 /* APT 钩子调:HOME 挂起时暂停播放(线程不会自动停,见 player.c 的说明) */
 void player_notify_suspend(void);
 

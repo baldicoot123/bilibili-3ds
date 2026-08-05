@@ -22,7 +22,7 @@ APP_TITLE       := bilibili
 # 那是给用户看"这是什么程序",不是看版本的地方。
 # 版本号在 source/main.c 的 APP_VERSION,设置页和打包脚本都从那里取。
 APP_DESCRIPTION := Bilibili Homebrew Client for 3DS
-APP_AUTHOR      := yinuo
+APP_AUTHOR      := Open-source community
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft

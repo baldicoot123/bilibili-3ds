@@ -22,6 +22,22 @@ typedef struct {
 	int     pages;
 } BiliVideo;
 
+/* UGC 合集（网页端叫 ugc_season），与单个稿件里的“分 P”是两层数据。
+ * id + mid 用于分页接口；total 是服务端声明的完整稿件数。 */
+typedef struct {
+	int64_t id;
+	int64_t mid;
+	int     total;
+	char    title[200];
+	char    author[64];
+} BiliCollection;
+
+typedef struct {
+	int64_t id;
+	int     media_count;
+	char    title[96];
+} BiliFavFolder;
+
 /* 一条评论。text 存原文,折行在绘制时按屏宽算(字体测量不是线程安全的,
  * 只能在主线程做) */
 typedef struct {
@@ -59,6 +75,9 @@ int bili_recommend(int page, BiliVideo *out, int max, int *count);
 /* 历史记录 / 默认收藏夹(均需登录) */
 int bili_history(int page, BiliVideo *out, int max, int *count);
 int bili_fav(int page, BiliVideo *out, int max, int *count);
+/* 当前账号创建的收藏夹，以及把一个视频收藏到指定收藏夹。 */
+int bili_fav_folders(BiliFavFolder *out, int max, int *count);
+int bili_fav_add(int64_t aid, int64_t folder_id);
 
 /* 视频搜索(需要 WBI 签名) */
 int bili_search(const char *keyword, int page, BiliVideo *out, int max, int *count);
@@ -78,6 +97,12 @@ typedef struct {
 /* 取分 P 列表。返回 0 成功,*count 输出条数(单 P 视频返回 1 条)。
  * 单 P 视频也走这条路,调用方不必分两种情况写。 */
 int bili_pagelist(const char *bvid, BiliPage *out, int max, int *count);
+
+/* 读取 bvid 所属的完整 UGC 合集。实现会先从 view.ugc_season 取得
+ * season_id/mid，再逐页读取 seasons_archives_list；不会只返回详情页中
+ * 内嵌的少量预览。视频不属于合集时返回 -1 并设置 bili_last_error()。 */
+int bili_collection(const char *bvid, BiliCollection *info,
+                    BiliVideo *out, int max, int *count);
 
 /* 拉 CC 字幕正文 JSON(malloc,调用方 free)。挑第一条中文轨,
  * 无字幕返回 -1 */
