@@ -35,8 +35,6 @@ AccessControlInfo:
   CanAccessCore2: true
   MemoryType: Application
   HandleTableSize: 0x200
-  IORegisterMapping: []
-  MemoryMapping: []
   SystemCallAccess:
     ControlMemory: 1
     QueryMemory: 2
