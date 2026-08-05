@@ -17,7 +17,8 @@ AccessControlInfo:
   DescVersion: 2
   IdealProcessor: 0
   AffinityMask: 3
-  Priority: 48
+  # makerom adds 32 for Application titles, producing the normal final priority 48.
+  Priority: 16
   MaxCpu: 0x9E
   DisableDebug: false
   EnableForceDebug: false
