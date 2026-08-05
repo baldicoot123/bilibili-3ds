@@ -21,8 +21,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install CIA packaging tools
         run: |
@@ -52,12 +50,16 @@ jobs:
             > SHA256SUMS.txt
 
       - name: Create patch from original v0.1.0 CIA
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git worktree add --detach /tmp/sagami-original 2d9f4d40ee30a3bb860cdaed140fc88ebbcd3272
-          make -C /tmp/sagami-original/SAGAMI-Dictionary -j2 cia
+          mkdir -p /tmp/sagami-original
+          gh run download 30970243885 \
+            --name sagami-dictionary-v0.1.0 \
+            --dir /tmp/sagami-original \
+            --repo "$GITHUB_REPOSITORY"
           bsdiff \
-            /tmp/sagami-original/SAGAMI-Dictionary/sagami_dictionary.cia \
+            /tmp/sagami-original/sagami_dictionary.cia \
             SAGAMI-Dictionary/sagami_dictionary.cia \
             SAGAMI-Dictionary/sagami_dictionary_priority_fix.bsdiff
           cd SAGAMI-Dictionary
