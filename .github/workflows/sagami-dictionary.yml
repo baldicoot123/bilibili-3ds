@@ -21,11 +21,13 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install CIA packaging tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl gh unzip
+          apt-get install -y --no-install-recommends bsdiff ca-certificates curl gh unzip
 
           curl -fL -o /tmp/bannertool.zip \
             https://github.com/diasurgical/bannertool/releases/download/1.2.0/bannertool.zip
@@ -49,6 +51,17 @@ jobs:
           sha256sum sagami_dictionary.cia sagami_dictionary.3dsx sagami_dictionary.smdh \
             > SHA256SUMS.txt
 
+      - name: Create patch from original v0.1.0 CIA
+        run: |
+          git worktree add --detach /tmp/sagami-original 2d9f4d40ee30a3bb860cdaed140fc88ebbcd3272
+          make -C /tmp/sagami-original/SAGAMI-Dictionary -j2 cia
+          bsdiff \
+            /tmp/sagami-original/SAGAMI-Dictionary/sagami_dictionary.cia \
+            SAGAMI-Dictionary/sagami_dictionary.cia \
+            SAGAMI-Dictionary/sagami_dictionary_priority_fix.bsdiff
+          cd SAGAMI-Dictionary
+          sha256sum sagami_dictionary_priority_fix.bsdiff >> SHA256SUMS.txt
+
       - name: Update release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,6 +70,7 @@ jobs:
             SAGAMI-Dictionary/sagami_dictionary.cia \
             SAGAMI-Dictionary/sagami_dictionary.3dsx \
             SAGAMI-Dictionary/sagami_dictionary.smdh \
+            SAGAMI-Dictionary/sagami_dictionary_priority_fix.bsdiff \
             SAGAMI-Dictionary/SHA256SUMS.txt \
             --clobber --repo "$GITHUB_REPOSITORY"
 
@@ -69,4 +83,5 @@ jobs:
             SAGAMI-Dictionary/sagami_dictionary.cia
             SAGAMI-Dictionary/sagami_dictionary.3dsx
             SAGAMI-Dictionary/sagami_dictionary.smdh
+            SAGAMI-Dictionary/sagami_dictionary_priority_fix.bsdiff
             SAGAMI-Dictionary/SHA256SUMS.txt
