@@ -278,6 +278,7 @@ static char s_toast[128] = "";      /* 上屏浮层提示(发弹幕结果等) */
 static u64  s_toast_until = 0;
 static bool (*s_login_cb)(void) = NULL;
 static PlayerCacheCallback s_cache_cb = NULL;
+static bool s_collection_request = false;
 
 /* ---------- 分 P ----------
  * 【为什么选集在播放器**里面**】
@@ -377,6 +378,11 @@ void player_set_meta(int64_t aid, int64_t cid, const char *bvid) {
 }
 void player_set_login_cb(bool (*cb)(void)) { s_login_cb = cb; }
 void player_set_cache_cb(PlayerCacheCallback cb) { s_cache_cb = cb; }
+bool player_take_collection_request(void) {
+	bool requested = s_collection_request;
+	s_collection_request = false;
+	return requested;
+}
 /* 开机时从存档恢复本模块的偏好。3D 故意不存:它按视频逐个手动开
  * (竖屏/2D 片开着 3D 只会花屏),记住上次的值弊大于利。 */
 void player_prefs_init(void) {
@@ -2902,6 +2908,9 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 		bool in_psettings = false;   /* 播放设置子页 */
 		bool in_comments = false;   /* 评论区子页(视频照常播) */
 		bool in_pages = false;      /* 选集子页(视频暂停,上屏留住画面) */
+		bool in_favorites = false;  /* 收藏夹选择页(视频照常播) */
+		BiliFavFolder fav_folders[64];
+		int fav_folder_n = 0;
 		/* 【选集是纯触屏页】滚动改成像素级,靠手指拖 —— 按行翻页在
 		 * 上百 P 的合集里要点几十次。摇杆和十字键在这一页**不接管**:
 		 * 它们在播放页是别的用途(方向键调进度、摇杆没占用),
@@ -2997,6 +3006,7 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				if (in_pages) { in_pages = false; }
 				else if (in_comments) { in_comments = false; }
 				else if (in_psettings) { in_psettings = false; }
+				else if (in_favorites) { in_favorites = false; }
 				else { p->quit = 1; ret = 0; break; }
 			}
 			bool do_pause = (kDown & KEY_A) != 0;
@@ -3005,6 +3015,8 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				if (!p->pause) do_pause = true;
 			}
 			bool want_dm_input = false;
+			bool want_fav_load = false;
+			int want_fav_add = -1;
 			/* X 短按在四档倍速间循环；长按不触发短按动作，直接复原。
 			 * 把动作放在松手沿，才能可靠地区分“短按一次”和“按住”。 */
 			if (kDown & KEY_X) {
@@ -3407,6 +3419,21 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				if (comment_draw(touched, (kHeld & KEY_TOUCH) != 0,
 				                 tp.px, tp.py))
 					in_comments = false;
+			} else if (in_favorites && !ui_console_active()) {
+				/* 收藏夹由账号接口实时读取；这里仅负责把目标交给 bili.c。
+				 * 视频与声音继续播放，不为了选一个文件夹退出 FFmpeg。 */
+				UiRow rows[64];
+				char counts[64][24];
+				for (int i = 0; i < fav_folder_n; i++) {
+					snprintf(counts[i], sizeof(counts[i]), "%d 个视频",
+					         fav_folders[i].media_count);
+					rows[i] = (UiRow){ fav_folders[i].title, counts[i],
+					                   "点按后把当前视频收藏到这个收藏夹。" };
+				}
+				int hit = ui_list_draw("选择收藏夹", rows, fav_folder_n, touched,
+				                       (kHeld & KEY_TOUCH) != 0,
+				                       (kUp & KEY_TOUCH) != 0, tp.px, tp.py);
+				if (hit >= 0 && hit < fav_folder_n) want_fav_add = hit;
 			} else if (in_psettings && !ui_console_active()) { /* 播放设置子页 */
 				/* 和主设置页共用同一套列表控件:加一项只是往数组里加一行,
 				 * 不用重排布局。原来是四行两列的按钮网格,已经塞满 8 个。 */
@@ -3554,7 +3581,7 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 
 				/* ---- 可拖动进度条 ---- */
 				#define BAR_X 14.0f
-				#define BAR_Y 178.0f
+				#define BAR_Y 184.0f
 				#define BAR_W 292.0f
 				#define BAR_H 10.0f
 				if (p->duration > 0.5) {
@@ -3605,12 +3632,11 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 						ui_text_z(bx, BAR_Y - 33, 0.7f, UI_SHARP, UI_COL_WHITE, db);
 					}
 				}
-				/* 多 P 视频:这个位置放「选集」而不是「返回」。
-				 * 返回本来就有 B 键(下面那行提示里写着),而选集在播放中
-				 * 是没有别的入口的 —— 把唯一没有替代品的功能放在按钮上。
-				 * 单 P 视频照旧显示「返回」:这时选集按钮点了也没意义。 */
+				/* 八卡片：2 列 x 4 行。最后一行底部停在 166px，和进度条
+				 * 扩大的触摸命中区（170px 起）留出间隙，任何卡片都不会再
+				 * 抢走拖动进度条的触摸。 */
 				if (s_pg_n > 1) {
-					if (ui_button(10, 50, 96, 40, "选集", UI_COL_SEL,
+					if (ui_button(10, 46, 145, 27, "选集", UI_COL_SEL,
 					              btn_touch, tp.px, tp.py)) {
 						in_pages = true;
 						/* 选集页有自己的滚动状态,但设置页的列表控件是全局的
@@ -3625,25 +3651,18 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 						 * 双屏机器上「上面放着、下面操作」本来就是最自然的
 						 * 用法,为翻个列表把视频停掉反而多此一举。 */
 					}
-				} else if (ui_button(10, 50, 96, 40, "返回", UI_COL_SEL,
+				} else if (ui_button(10, 46, 145, 27, "返回", UI_COL_SEL,
 				                     btn_touch, tp.px, tp.py)) {
 					p->quit = 1; ret = 0;
 				}
-				if (ui_button(112, 50, 96, 40, p->pause ? "播放" : "暂停",
+				if (ui_button(165, 46, 145, 27, p->pause ? "播放" : "暂停",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) do_pause = true;
-				if (ui_button(214, 50, 96, 40, "设置", UI_COL_SEL,
+				if (ui_button(10, 77, 145, 27, "设置", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py)) {
 					in_psettings = true;
 					ui_list_reset();   /* 滚动和高亮归零,别带着上次的状态进来 */
 				}
-				/* 这一行只放得下一条。没声音优先:3D 那条是"可以更好",
-				 * 静音是"东西没按预期工作",后者更需要解释 */
-				if (!p->audio_ok && p->audio_err[0])
-					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT, p->audio_err);
-				else if (s_pref_3d != 0 && s_cur_qn < 32)
-					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT,
-					        "3D 建议切 480P 更清晰");
-				if (ui_button(10, 100, 96, 40,
+				if (ui_button(165, 77, 145, 27,
 				              s_pref_danmaku ? "弹幕:开" : "弹幕:关",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					s_pref_danmaku = !s_pref_danmaku;
@@ -3654,31 +3673,75 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 					 * 否则「哪次算数」取决于用户从哪儿点的。 */
 					settings_set("danmaku", s_pref_danmaku);
 				}
-				/* 缓存按钮放到原“发弹幕”位置。旧位置在 y=154，会压住
-				 * y=178 的进度条和拖动命中区；这里属于标准按钮网格，
-				 * 不会再遮挡进度。 */
 				if (s_cache_cb &&
-				    ui_button(112, 100, 96, 40,
+				    ui_button(10, 108, 145, 27,
 				              s_pg_n > 1 ? "缓存本P" : "缓存视频",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					s_toast[0] = 0;
 					s_cache_cb(false, s_toast, sizeof(s_toast));
 					s_toast_until = osGetTime() + 5000;
 				}
-				/* 右下角:评论区。视频不暂停 —— 双屏机器上「上屏看片、
-				 * 下屏看评论」本来就是最自然的用法 */
-				if (ui_button(214, 100, 96, 40, "评论",
+				if (ui_button(165, 108, 145, 27, "评论",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					in_comments = true;
 					if (s_meta_aid && comment_count() == 0 && !comment_loading())
 						comment_load_async(s_meta_aid, 1);
 				}
-				/* 3D 的说明挪到「设置」子页去了:主覆盖层这行是常用键位,
-				 * 塞进只在开 3D 时才有意义的话会挤掉真正常用的信息。 */
-				ui_text(10, 204, UI_SHARP, UI_COL_DIM,
+				if (ui_button(10, 139, 145, 27, "查看合集", UI_COL_SEL,
+				              btn_touch, tp.px, tp.py)) {
+					s_collection_request = true;
+					p->quit = 1;
+					ret = 0;
+				}
+				if (ui_button(165, 139, 145, 27, "收藏", UI_COL_SEL,
+				              btn_touch, tp.px, tp.py)) {
+					want_fav_load = true;
+				}
+				ui_text(10, 210, UI_SHARP, UI_COL_DIM,
 				        "A暂停  X倍速(长按复原)  B返回");
 			}
 			ui_end();
+
+			if (want_fav_load) {
+				bool can = bili_logged_in();
+				if (!can && s_login_cb) {
+					/* 扫码页可能停留很久，先暂停音画；登录完成后保持暂停，
+					 * 由用户明确点“播放”恢复。 */
+					p->pause = 1;
+					can = s_login_cb();
+				}
+				if (!can) {
+					snprintf(s_toast, sizeof(s_toast), "收藏需要先登录");
+					s_toast_until = osGetTime() + 5000;
+				} else if (bili_fav_folders(fav_folders,
+				                            (int)(sizeof(fav_folders) /
+				                                  sizeof(fav_folders[0])),
+				                            &fav_folder_n) == 0) {
+					in_favorites = true;
+					ui_list_reset();
+				} else {
+					snprintf(s_toast, sizeof(s_toast), "读取收藏夹失败:%s",
+					         bili_last_error());
+					s_toast_until = osGetTime() + 5000;
+				}
+			}
+			if (want_fav_add >= 0 && want_fav_add < fav_folder_n) {
+				/* 少数列表接口不给 aid；到真正提交时再补一次，不让每次
+				 * 播放都为一个可能不会使用的按钮多发请求。 */
+				if (!s_meta_aid && s_meta_bvid[0]) {
+					int64_t cid = s_meta_cid;
+					bili_get_cid(s_meta_bvid, &cid, &s_meta_aid);
+				}
+				if (bili_fav_add(s_meta_aid, fav_folders[want_fav_add].id) == 0) {
+					snprintf(s_toast, sizeof(s_toast), "已收藏到:%s",
+					         fav_folders[want_fav_add].title);
+					in_favorites = false;
+				} else {
+					snprintf(s_toast, sizeof(s_toast), "收藏失败:%s",
+					         bili_last_error());
+				}
+				s_toast_until = osGetTime() + 5000;
+			}
 
 			/* 字幕:等播放真正跑起来(缓冲结束)再拉,且与弹幕错开 1 秒。
 			 * 与取流/弹幕并发时,3DS httpc 会把响应发错对象 */

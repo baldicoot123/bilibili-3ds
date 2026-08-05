@@ -656,6 +656,95 @@ int bili_fav(int page, BiliVideo *out, int max, int *count) {
 	return 0;
 }
 
+int bili_fav_folders(BiliFavFolder *out, int max, int *count) {
+	if (count) *count = 0;
+	if (!out || !count || max <= 0) return -1;
+	if (!s_mid && fetch_nav() != 0) return -1;
+	if (!s_mid || !s_logged_in) {
+		snprintf(s_last_err, sizeof(s_last_err), "请先登录");
+		return -1;
+	}
+	char mid[24], url[224];
+	i64_to_str(s_mid, mid);
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=%s",
+	         mid);
+	char *body = NULL;
+	Json *j = api_get(url, &body);
+	if (!j) return -1;
+	int arr = json_find(j, -1, "data.list");
+	int n = json_arr_len(j, arr), got = 0;
+	for (int i = 0; i < n && got < max; i++) {
+		int el = json_arr_at(j, arr, i);
+		BiliFavFolder f;
+		memset(&f, 0, sizeof(f));
+		int64_t media_count = 0;
+		if (!json_get_int(j, el, "id", &f.id) || !f.id) continue;
+		json_get_str(j, el, "title", f.title, sizeof(f.title));
+		if (json_get_int(j, el, "media_count", &media_count))
+			f.media_count = (int)media_count;
+		if (!f.title[0]) snprintf(f.title, sizeof(f.title), "收藏夹 %d", got + 1);
+		out[got++] = f;
+	}
+	json_free(j);
+	free(body);
+	*count = got;
+	if (!got) snprintf(s_last_err, sizeof(s_last_err), "没有可用收藏夹");
+	return got > 0 ? 0 : -1;
+}
+
+int bili_fav_add(int64_t aid, int64_t folder_id) {
+	const char *csrf = net_get_cookie("bili_jct");
+	if (!s_logged_in) {
+		snprintf(s_last_err, sizeof(s_last_err), "请先登录");
+		return -1;
+	}
+	if (!csrf || !csrf[0]) {
+		snprintf(s_last_err, sizeof(s_last_err),
+		         "收藏需要 bili_jct，请按 README 导入");
+		return -1;
+	}
+	if (!aid || !folder_id) {
+		snprintf(s_last_err, sizeof(s_last_err), "缺少视频或收藏夹 ID");
+		return -1;
+	}
+	char aidstr[24], fidstr[24];
+	i64_to_str(aid, aidstr);
+	i64_to_str(folder_id, fidstr);
+	const char *keys[] = { "rid", "type", "add_media_ids", "csrf" };
+	const char *vals[] = { aidstr, "2", fidstr, csrf };
+	HttpResponse res;
+	if (net_post_fields("https://api.bilibili.com/x/v3/fav/resource/deal",
+	                    keys, vals, 4, &res) != 0) {
+		snprintf(s_last_err, sizeof(s_last_err), "网络失败 step%d", g_net_last_step);
+		return -1;
+	}
+	int rc = -1;
+	if (res.status != 200 || !res.data) {
+		snprintf(s_last_err, sizeof(s_last_err), "HTTP %d", res.status);
+	} else {
+		Json *j = json_parse(res.data, res.len);
+		if (!j) {
+			snprintf(s_last_err, sizeof(s_last_err), "响应解析失败");
+		} else {
+			int64_t code = -1;
+			json_get_int(j, -1, "code", &code);
+			if (code == 0) {
+				rc = 0;
+				s_last_err[0] = 0;
+			} else {
+				char msg[64] = {0};
+				json_get_str(j, -1, "message", msg, sizeof(msg));
+				snprintf(s_last_err, sizeof(s_last_err), "%ld %s",
+				         (long)code, msg[0] ? msg : "收藏失败");
+			}
+			json_free(j);
+		}
+	}
+	net_response_free(&res);
+	return rc;
+}
+
 int bili_popular(int page, BiliVideo *out, int max, int *count) {
 	*count = 0;
 	char url[256];
@@ -1034,6 +1123,172 @@ int bili_pagelist(const char *bvid, BiliPage *out, int max, int *count) {
 	free(body);
 	if (r == 0) printf("view.pages: %d part(s)\n", *count);
 	return r;
+}
+
+/* ---------- UGC 合集（跨稿件） ----------
+ *
+ * view.ugc_season 只负责告诉我们“这条视频属于哪个合集”，以及提供一份
+ * 内嵌 episodes 作为 cid 提示；完整清单以 polymer 的分页接口为准。
+ * 两份数据合并后，绝大多数合集条目不用再逐条请求 cid，同时仍能覆盖
+ * 超过详情页预览数量的长合集。 */
+static int collection_find_video(const BiliVideo *a, int n, const char *bvid) {
+	for (int i = 0; i < n; i++)
+		if (!strcmp(a[i].bvid, bvid)) return i;
+	return -1;
+}
+
+static int parse_collection_episodes(const Json *j, BiliVideo *out, int max,
+                                     const char *fallback_author) {
+	int sections = json_find(j, -1, "data.ugc_season.sections");
+	int sn = json_arr_len(j, sections), got = 0;
+	for (int si = 0; si < sn && got < max; si++) {
+		int sec = json_arr_at(j, sections, si);
+		int episodes = json_find(j, sec, "episodes");
+		int en = json_arr_len(j, episodes);
+		for (int ei = 0; ei < en && got < max; ei++) {
+			int el = json_arr_at(j, episodes, ei);
+			BiliVideo v;
+			memset(&v, 0, sizeof(v));
+			v.views = -1;
+			if (!json_get_str(j, el, "bvid", v.bvid, sizeof(v.bvid)) ||
+			    !v.bvid[0] || collection_find_video(out, got, v.bvid) >= 0)
+				continue;
+			json_get_int(j, el, "aid", &v.aid);
+			json_get_int(j, el, "cid", &v.cid);
+			json_get_str(j, el, "title", v.title, sizeof(v.title));
+			if (!v.title[0])
+				json_get_str(j, el, "arc.title", v.title, sizeof(v.title));
+			strip_html(v.title);
+			json_get_str(j, el, "arc.pic", v.pic, sizeof(v.pic));
+			fix_pic_url(v.pic, sizeof(v.pic));
+			json_get_str(j, el, "arc.author.name", v.author, sizeof(v.author));
+			if (!v.author[0] && fallback_author)
+				snprintf(v.author, sizeof(v.author), "%s", fallback_author);
+			int64_t d = 0, views = -1, pages = 0;
+			if (json_get_int(j, el, "arc.duration", &d)) v.duration = (int)d;
+			if (json_get_int(j, el, "arc.stat.view", &views)) v.views = views;
+			if (json_get_int(j, el, "arc.videos", &pages) && pages > 0)
+				v.pages = (int)pages;
+			else {
+				int pa = json_find(j, el, "pages");
+				int pn = json_arr_len(j, pa);
+				if (pn > 0) v.pages = pn;
+			}
+			out[got++] = v;
+		}
+	}
+	return got;
+}
+
+int bili_collection(const char *bvid, BiliCollection *info,
+                    BiliVideo *out, int max, int *count) {
+	if (count) *count = 0;
+	if (info) memset(info, 0, sizeof(*info));
+	if (!bvid || !bvid[0] || !info || !out || !count || max <= 0) return -1;
+
+	bool is_av = (bvid[0] == 'a' && bvid[1] == 'v');
+	char url[320];
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/web-interface/view?%s=%s",
+	         is_av ? "aid" : "bvid", is_av ? bvid + 2 : bvid);
+	char *body = NULL;
+	Json *j = api_get(url, &body);
+	if (!j) return -1;
+	int season = json_find(j, -1, "data.ugc_season");
+	int64_t ep_total = 0;
+	bool have = season >= 0 && json_get_int(j, season, "id", &info->id) &&
+	            info->id > 0;
+	if (have) {
+		json_get_int(j, season, "mid", &info->mid);
+		json_get_int(j, season, "ep_count", &ep_total);
+		json_get_str(j, season, "title", info->title, sizeof(info->title));
+		json_get_str(j, -1, "data.owner.name", info->author,
+		             sizeof(info->author));
+		if (!info->mid) json_get_int(j, -1, "data.owner.mid", &info->mid);
+	}
+	if (!have || !info->mid) {
+		snprintf(s_last_err, sizeof(s_last_err), "该视频不属于合集");
+		json_free(j);
+		free(body);
+		return -1;
+	}
+
+	BiliVideo *hints = (BiliVideo *)calloc((size_t)max, sizeof(*hints));
+	if (!hints) {
+		snprintf(s_last_err, sizeof(s_last_err), "内存不足");
+		json_free(j);
+		free(body);
+		return -1;
+	}
+	int hint_n = parse_collection_episodes(j, hints, max, info->author);
+	json_free(j);
+	free(body);
+	body = NULL;
+
+	char mid[24], sid[24];
+	i64_to_str(info->mid, mid);
+	i64_to_str(info->id, sid);
+	const int page_size = 30;
+	int got = 0, page = 1, total = ep_total > 0 ? (int)ep_total : 0;
+	for (;;) {
+		snprintf(url, sizeof(url),
+		         "https://api.bilibili.com/x/polymer/web-space/"
+		         "seasons_archives_list?mid=%s&season_id=%s&sort_reverse=false&"
+		         "page_num=%d&page_size=%d", mid, sid, page, page_size);
+		j = api_get(url, &body);
+		if (!j) {
+			/* 详情页确实带了完整 ep_count 时，内嵌数组是可靠兜底；
+			 * 否则宁可报错，也不能把预览冒充“完整合集”。 */
+			if (hint_n > 0 && ep_total > 0 && hint_n == (int)ep_total) {
+				memcpy(out, hints, (size_t)hint_n * sizeof(*out));
+				got = hint_n;
+				s_last_err[0] = 0;
+				break;
+			}
+			free(hints);
+			return -1;
+		}
+		int64_t api_total = 0;
+		if (json_get_int(j, -1, "data.page.total", &api_total) && api_total > 0)
+			total = (int)api_total;
+		if (total > max) {
+			snprintf(s_last_err, sizeof(s_last_err),
+			         "合集共%d条，超过本机上限%d", total, max);
+			json_free(j);
+			free(body);
+			free(hints);
+			return -2;
+		}
+		int arr = json_find(j, -1, "data.archives");
+		int n = json_arr_len(j, arr);
+		for (int i = 0; i < n && got < max; i++) {
+			int el = json_arr_at(j, arr, i);
+			BiliVideo v;
+			parse_video_item(j, el, &v, false);
+			if (!v.bvid[0] || !v.title[0] ||
+			    collection_find_video(out, got, v.bvid) >= 0)
+				continue;
+			if (!v.author[0])
+				snprintf(v.author, sizeof(v.author), "%s", info->author);
+			int hi = collection_find_video(hints, hint_n, v.bvid);
+			if (hi >= 0) {
+				v.cid = hints[hi].cid;
+				if (!v.aid) v.aid = hints[hi].aid;
+				if (!v.pages) v.pages = hints[hi].pages;
+			}
+			out[got++] = v;
+		}
+		json_free(j);
+		free(body);
+		body = NULL;
+		if (n <= 0 || (total > 0 && got >= total)) break;
+		page++;
+	}
+	free(hints);
+	info->total = total > 0 ? total : got;
+	*count = got;
+	printf("collection: %d/%d video(s)\n", got, info->total);
+	return (got > 0 && got == info->total) ? 0 : -1;
 }
 
 /* CC 字幕:x/player/wbi/v2 拿字幕轨列表,再拉正文 JSON */

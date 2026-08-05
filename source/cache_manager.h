@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CACHE_MAX_TASKS 512
+#define CACHE_MAX_TASKS 1000
 #define CACHE_PATH_MAX  512
 
 typedef enum {

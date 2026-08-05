@@ -89,11 +89,11 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.5.0"
+#define APP_VERSION "1.6.0"
 
 /* ---------- 分 P ----------
- * 与持久化队列上限一致，确保“一键缓存全集”拿到的不是当前可视区或前
- * 200 项，而是 pagelist 一次返回的完整常见合集。全部放静态区，避免把
+ * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前
+ * 200 项，而是 pagelist 一次返回的完整分P。全部放静态区，避免把
  * 几百条标题压进播放器的调用栈。 */
 #define MAX_PAGES CACHE_MAX_TASKS
 static BiliPage s_pages[MAX_PAGES];
@@ -106,6 +106,10 @@ static int   s_pg_dur[MAX_PAGES];
 static DownloadTask s_cache_view[CACHE_MAX_TASKS];
 static CacheEnqueueItem s_batch_items[MAX_PAGES];
 static char s_batch_titles[MAX_PAGES][200];
+static BiliCollection s_collection_info;
+static BiliVideo s_collection_videos[CACHE_MAX_TASKS];
+static int s_collection_n = 0;
+static int s_collection_resolve_at = -1;
 /* 播放器内的缓存按钮只回调入队，不直接依赖缓存模块。这里保存本次播放
  * 对应的视频身份；播放结束立即清空，避免陈旧目标串到下一条视频。 */
 static BiliVideo *s_play_cache_video = NULL;
@@ -141,7 +145,9 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 static void busy_frame(const char *msg);   /* 定义在下面 */
 static int  run_bg(int (*fn)(void *), void *arg, const char *msg);  /* 同上 */
 static bool s_job_cancelled;   /* 上一次 run_bg 是否被 B 掐掉,定义在下面 */
+static bool play_video(BiliVideo *v);
 static void play_selected(void);
+static void collection_page(BiliVideo *origin);
 static void page_label(const BiliPage *pg, char *out, size_t n);
 
 /* 列表加载最多试几次(含第一次)。3 次、退避 0.8s+1.6s —— 再多就该让
@@ -154,6 +160,7 @@ static const char *s_job_bvid;
 static int64_t s_job_cid;
 static char *s_job_url;
 static int s_job_qn;
+static BiliVideo *s_job_video;
 
 static int pagelist_job(void *u) {
 	(void)u;
@@ -162,6 +169,30 @@ static int pagelist_job(void *u) {
 static int playurl_job(void *u) {
 	(void)u;
 	return bili_get_play_url(s_job_bvid, s_job_cid, s_job_qn, s_job_url, 2048);
+}
+static int video_cid_job(void *u) {
+	(void)u;
+	return s_job_video ? bili_get_cid(s_job_video->bvid, &s_job_video->cid,
+	                                  &s_job_video->aid) : -1;
+}
+static int collection_job(void *u) {
+	(void)u;
+	return bili_collection(s_job_bvid, &s_collection_info,
+	                       s_collection_videos, CACHE_MAX_TASKS,
+	                       &s_collection_n);
+}
+static int collection_resolve_job(void *u) {
+	(void)u;
+	for (int i = 0; i < s_collection_n; i++) {
+		s_collection_resolve_at = i;
+		if (!s_collection_videos[i].cid &&
+		    bili_get_cid(s_collection_videos[i].bvid,
+		                 &s_collection_videos[i].cid,
+		                 &s_collection_videos[i].aid) != 0)
+			return -1;
+	}
+	s_collection_resolve_at = -1;
+	return 0;
 }
 
 static void list_thumbs_stop(void) {
@@ -509,7 +540,7 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 	if (ui_button(112, 112, 96, 36, "缓存当前", UI_COL_SEL,
 	              touched, tx, ty))
 		act->cache = true;
-	if (ui_button(214, 112, 96, 36, "查看选集", UI_COL_SEL,
+	if (ui_button(214, 112, 96, 36, "查看合集", UI_COL_SEL,
 	              touched, tx, ty))
 		act->parts = true;
 	if (ui_button(10, 154, 300, 36, "离线下载任务", UI_COL_SEL,
@@ -563,9 +594,8 @@ static void draw_settings(bool touched, bool holding, bool released,
 	const char *ttl = (f >= 0 && f < SET_N) ? rows[f].name : "设置";
 	const char *body = (f >= 0 && f < SET_N) ? rows[f].help
 	                 : "下屏点按修改。\n碰哪一项,这里就说明哪一项。";
-	char brand[48];
-	snprintf(brand, sizeof(brand), "bilibili v%s   作者小红书 94133173379",
-	         APP_VERSION);
+	char brand[32];
+	snprintf(brand, sizeof(brand), "bilibili v%s", APP_VERSION);
 	ui_help_draw(ttl, body, "仅供学习交流  严禁用于商业用途", brand);
 
 	if (ui_console_active()) return;   /* 调试台占着下屏 */
@@ -998,10 +1028,9 @@ static void cache_selected(void) {
 static void draw_cache_page(int sel, const char *notice) {
 	int n = cache_manager_snapshot(s_cache_view, CACHE_MAX_TASKS);
 	ui_begin();
-	ui_rect_z(0, 0, 0.6f, 400, 26, UI_COL_ACCENT);
 	char head[48];
 	snprintf(head, sizeof(head), "离线缓存  %d/%d", n ? sel + 1 : 0, n);
-	ui_text(6, 3, 0.7f, UI_COL_WHITE, head);
+	ui_text(6, 3, 0.7f, UI_COL_DIM, head);
 	if (!n) {
 		ui_text(112, 104, UI_SHARP, UI_COL_DIM, "还没有缓存任务");
 	} else {
@@ -1110,31 +1139,25 @@ static void cache_list_page(void) {
 	}
 }
 
-/* 主页“查看选集”：先把真实 pagelist 展示出来，再允许缓存全集。
- * 这样“缓存完整列表”只在用户已经看见会加入哪些条目之后出现，避免主页
- * 一个没有上下文的大按钮把几十、几百条任务直接塞进队列。 */
-static void parts_page(void) {
-	if (!s_net_ok || s_sel < 0 || s_sel >= s_count) return;
-	BiliVideo *v = &s_list[s_sel];
+/* 真正的“合集”是 ugc_season（跨多个 bvid），不是单个稿件的分 P。
+ * bili_collection() 已经逐页取全；这里展示的条目数就是缓存完整合集时
+ * 将要处理的真实数量。 */
+static void collection_page(BiliVideo *origin) {
+	if (!s_net_ok || !origin || !origin->bvid[0]) return;
 	list_thumbs_stop();
-	s_npages = 0;
-	s_job_bvid = v->bvid;
-	if (run_bg(pagelist_job, NULL, "读取选集") != 0 || s_npages <= 0) {
-		snprintf(s_busy, sizeof(s_busy), "读取选集失败:%s", bili_last_error());
-		list_thumbs_start(s_sel);
+	s_collection_n = 0;
+	s_job_bvid = origin->bvid;
+	if (run_bg(collection_job, NULL, "读取完整合集") != 0 ||
+	    s_collection_n <= 0) {
+		snprintf(s_busy, sizeof(s_busy), "读取合集失败:%s", bili_last_error());
+		if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
 		return;
-	}
-	v->pages = s_npages;
-	for (int i = 0; i < s_npages; i++) {
-		page_label(&s_pages[i], s_pg_label[i], sizeof(s_pg_label[i]));
-		s_pg_labelp[i] = s_pg_label[i];
-		s_pg_dur[i] = s_pages[i].duration;
 	}
 
 	int sel = 0;
-	for (int i = 0; i < s_npages; i++)
-		if (s_pages[i].cid == v->cid) { sel = i; break; }
-	char notice[128] = "";
+	for (int i = 0; i < s_collection_n; i++)
+		if (!strcmp(s_collection_videos[i].bvid, origin->bvid)) { sel = i; break; }
+	char notice[160] = "";
 	while (aptMainLoop()) {
 		hidScanInput();
 		u32 kd = hidKeysDown();
@@ -1142,34 +1165,37 @@ static void parts_page(void) {
 		bool touched = (kd & KEY_TOUCH) != 0;
 		if (touched) hidTouchRead(&tp);
 		if ((kd & KEY_UP) && sel > 0) sel--;
-		if ((kd & KEY_DOWN) && sel + 1 < s_npages) sel++;
+		if ((kd & KEY_DOWN) && sel + 1 < s_collection_n) sel++;
 
 		ui_begin();
 		int first = sel - 3;
 		if (first < 0) first = 0;
-		if (first > s_npages - 7) first = s_npages - 7;
+		if (first > s_collection_n - 7) first = s_collection_n - 7;
 		if (first < 0) first = 0;
-		for (int i = first; i < s_npages && i < first + 7; i++) {
+		for (int i = first; i < s_collection_n && i < first + 7; i++) {
 			float y = 4.0f + (float)(i - first) * 33.0f;
 			if (i == sel) ui_rect_z(0, y, 0.15f, 400, 31, UI_COL_SEL);
 			ui_text_clipped(8, y + 5, UI_SHARP,
 			                i == sel ? UI_COL_WHITE : UI_COL_TEXT,
-			                s_pg_label[i], 326);
-			if (s_pg_dur[i] > 0) {
+			                s_collection_videos[i].title, 326);
+			if (s_collection_videos[i].duration > 0) {
 				char db[16];
-				snprintf(db, sizeof(db), "%d:%02d",
-				         s_pg_dur[i] / 60, s_pg_dur[i] % 60);
+				int d = s_collection_videos[i].duration;
+				snprintf(db, sizeof(db), "%d:%02d", d / 60, d % 60);
 				ui_text(344, y + 5, 0.65f, UI_COL_DIM, db);
 			}
 		}
 
 		ui_begin_bottom();
-		ui_text_clipped(10, 6, UI_SHARP, UI_COL_TEXT, v->title, 300);
-		bool all = ui_button(10, 38, 300, 40, "缓存完整列表", UI_COL_ACCENT,
+		char title[240];
+		snprintf(title, sizeof(title), "%s  (%d个视频)",
+		         s_collection_info.title, s_collection_n);
+		ui_text_clipped(10, 6, UI_SHARP, UI_COL_TEXT, title, 300);
+		bool all = ui_button(10, 38, 300, 40, "缓存完整合集", UI_COL_SEL,
 		                     touched, tp.px, tp.py);
-		bool play = ui_button(10, 86, 145, 40, "播放本集", UI_COL_SEL,
+		bool play = ui_button(10, 86, 145, 40, "播放本视频", UI_COL_SEL,
 		                      touched, tp.px, tp.py);
-		bool one = ui_button(165, 86, 145, 40, "缓存本集", UI_COL_SEL,
+		bool one = ui_button(165, 86, 145, 40, "缓存本视频", UI_COL_SEL,
 		                     touched, tp.px, tp.py);
 		bool tasks = ui_button(10, 134, 145, 40, "下载任务", UI_COL_SEL,
 		                       touched, tp.px, tp.py);
@@ -1182,27 +1208,61 @@ static void parts_page(void) {
 
 		if (back || (kd & KEY_B)) break;
 		if (all) {
-			cache_all_video_parts(v, g_qn, notice, sizeof(notice));
+			s_collection_resolve_at = -1;
+			if (run_bg(collection_resolve_job, NULL, "读取合集视频信息") != 0) {
+				int bad = s_collection_resolve_at;
+				snprintf(notice, sizeof(notice), "第%d项信息读取失败:%s",
+				         bad >= 0 ? bad + 1 : 0, bili_last_error());
+			} else {
+				for (int i = 0; i < s_collection_n; i++)
+					s_batch_items[i] = (CacheEnqueueItem){
+						s_collection_videos[i].bvid,
+						s_collection_videos[i].cid,
+						s_collection_videos[i].aid,
+						s_collection_videos[i].title,
+						s_collection_videos[i].author,
+						g_qn
+					};
+				int added = 0, duplicates = 0;
+				int r = cache_manager_enqueue_batch(s_batch_items, s_collection_n,
+				                                    &added, &duplicates);
+				if (added) download_worker_wake();
+				if (r == -2)
+					snprintf(notice, sizeof(notice),
+					         "加入%d个，队列已满；已有%d个", added, duplicates);
+				else if (r != 0)
+					snprintf(notice, sizeof(notice),
+					         "合集入队不完整:加入%d 已有%d 错误%d",
+					         added, duplicates, r);
+				else if (!added)
+					snprintf(notice, sizeof(notice),
+					         "完整合集%d个均已缓存或在队列", duplicates);
+				else
+					snprintf(notice, sizeof(notice),
+					         "完整合集加入%d个，已有%d个不重复", added, duplicates);
+			}
 		}
 		if (one) {
-			char title[200];
-			cache_part_title(v, &s_pages[sel], title, sizeof(title));
-			int r = cache_manager_enqueue(v->bvid, s_pages[sel].cid, v->aid,
-			                              title, v->author, g_qn);
-			cache_enqueue_message(v->bvid, s_pages[sel].cid, r,
-			                      notice, sizeof(notice));
+			BiliVideo *v = &s_collection_videos[sel];
+			if (!v->cid) {
+				s_job_video = v;
+				if (run_bg(video_cid_job, NULL, "读取视频信息") != 0) {
+					snprintf(notice, sizeof(notice), "无法缓存:%s", bili_last_error());
+					continue;
+				}
+			}
+			int r = cache_manager_enqueue(v->bvid, v->cid, v->aid,
+			                              v->title, v->author, g_qn);
+			cache_enqueue_message(v->bvid, v->cid, r, notice, sizeof(notice));
 		}
 		if (tasks) cache_list_page();
 		if (play || (kd & KEY_A)) {
-			v->cid = s_pages[sel].cid;
-			play_selected();
-			/* 播放器返回时会恢复列表封面；选集页不画封面，先停掉，
-			 * 避免它和这里的缓存/任务操作并发请求。 */
+			(void)play_video(&s_collection_videos[sel]);
 			list_thumbs_stop();
 		}
 		if (net_is_shutting_down() || aptShouldClose()) break;
 	}
-	if (!net_is_shutting_down()) list_thumbs_start(s_sel);
+	if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
 }
 
 /* 分P 一行的显示文本:"P3  标题"(没标题就只有 "P3") */
@@ -1300,10 +1360,12 @@ static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
 	sub_free();
 }
 
-static void play_selected(void) {
-	if (!s_net_ok) { load_list(); return; }
-	if (s_sel >= s_count) return;
-	BiliVideo *v = &s_list[s_sel];
+static bool play_video(BiliVideo *v) {
+	if (!s_net_ok) { load_list(); return false; }
+	if (!v || !v->bvid[0]) return false;
+	bool open_collection = false;
+	/* 清掉上一次已消费场景外可能遗留的请求。 */
+	(void)player_take_collection_request();
 
 	/* 第一件事:停掉封面下载线程。
 	 * 它们是唯一绕过 net 串行锁的请求(net_get_img),留着的话
@@ -1326,7 +1388,7 @@ static void play_selected(void) {
 			         (why && why[0]) ? why : "获取 cid 失败");
 			set_status(msg, "get cid failed (see console)");
 			snprintf(s_busy, sizeof(s_busy), "%s", msg);  /* 状态条留原因 */
-			return;
+			return false;
 		}
 	}
 	/* ---- 分 P ----
@@ -1372,6 +1434,10 @@ static void play_selected(void) {
 				         s_pages[cur].page, v->title);
 			player_set_pages(s_pg_labelp, s_pg_dur, s_npages, cur);
 			play_stream(v, s_pages[cur].cid, t);
+			if (player_take_collection_request()) {
+				open_collection = true;
+				break;
+			}
 			/* 【只有在选集里挑了才继续】按 B 退出播放器是「我看完了」,
 			 * 不是「我要挑下一集」—— 以前播完无条件弹选集页,
 			 * 想走的人得按两次 B。 */
@@ -1394,6 +1460,7 @@ static void play_selected(void) {
 		s_busy_minimal = false;
 	} else {
 		play_stream(v, v->cid, v->title);
+		open_collection = player_take_collection_request();
 	}
 	player_set_pages(NULL, NULL, 0, 0);
 
@@ -1402,6 +1469,14 @@ static void play_selected(void) {
 	 * "Closing software"。 */
 	if (s_count > 0 && !net_is_shutting_down()) list_thumbs_start(s_sel);
 	ui_trace_sync("exit-path: play_video done");
+	return open_collection;
+}
+
+static void play_selected(void) {
+	if (s_sel < 0 || s_sel >= s_count) return;
+	BiliVideo *v = &s_list[s_sel];
+	if (play_video(v) && !net_is_shutting_down() && !aptShouldClose())
+		collection_page(v);
 }
 
 /* APT 事件回调(HOME/睡眠/退出)。只做置标志这类轻活,别在回调里干重活 */
@@ -1585,7 +1660,8 @@ int main(void) {
 			/* 推荐/热门/历史改为连续流：视口接近尾部就追加下一页，
 			 * 原有条目、选中项和滚动位置全部保留。 */
 			bool endless = s_mode == MODE_RECOMMEND ||
-			               s_mode == MODE_POPULAR || s_mode == MODE_HISTORY;
+			               s_mode == MODE_POPULAR || s_mode == MODE_HISTORY ||
+			               s_mode == MODE_FAV;
 			int last_visible = (int)((s_scroll_t + LIST_H) / ROW_H);
 			if (!s_in_settings && !(kDown & KEY_R) && endless &&
 			    s_count > 0 && s_count < MAX_LIST &&
@@ -1714,7 +1790,8 @@ int main(void) {
 		if (act.search) do_search();
 		if (act.settings) { s_in_settings = true; ui_list_reset(); }
 		if (act.cache) cache_selected();
-		if (act.parts) parts_page();
+		if (act.parts && s_sel >= 0 && s_sel < s_count)
+			collection_page(&s_list[s_sel]);
 		if (act.downloads) {
 			list_thumbs_stop();
 			cache_list_page();
