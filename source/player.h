@@ -48,9 +48,16 @@ void player_set_login_cb(bool (*cb)(void));
 typedef int (*PlayerCacheCallback)(bool all_parts, char *message, size_t message_len);
 void player_set_cache_cb(PlayerCacheCallback cb);
 
-/* 播放控制页点“查看合集”时，播放器先安全退出当前流；main.c 取走请求后
- * 再读取跨稿件 UGC 合集，避免把 B 站接口逻辑塞进 FFmpeg 播放管线。 */
-bool player_take_collection_request(void);
+/* 收藏夹列表在开播前由 main.c 安全预取，避免播放长连接和收藏 API 并发。
+ * 用户点中目标后播放器安全退出流，main.c 再提交收藏。 */
+void player_set_favorite_folders(const int64_t *ids,
+                                 const char *const *titles,
+                                 const int *counts, int n);
+int64_t player_take_favorite_request(void);
+
+/* 定时关机由播放器设置，但在主页也继续计时；两个主循环都调用 poll。 */
+void player_shutdown_timer_poll(void);
+int  player_shutdown_timer_remaining(void); /* 向上取整的剩余分钟；0=未设置 */
 
 /* APT 钩子调:HOME 挂起时暂停播放(线程不会自动停,见 player.c 的说明) */
 void player_notify_suspend(void);

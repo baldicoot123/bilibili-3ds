@@ -278,7 +278,12 @@ static char s_toast[128] = "";      /* 上屏浮层提示(发弹幕结果等) */
 static u64  s_toast_until = 0;
 static bool (*s_login_cb)(void) = NULL;
 static PlayerCacheCallback s_cache_cb = NULL;
-static bool s_collection_request = false;
+static const int64_t     *s_fav_ids = NULL;
+static const char *const *s_fav_titles = NULL;
+static const int         *s_fav_counts = NULL;
+static int s_fav_n = 0;
+static int64_t s_favorite_request = 0;
+static u64 s_shutdown_at = 0;
 
 /* ---------- 分 P ----------
  * 【为什么选集在播放器**里面**】
@@ -378,10 +383,44 @@ void player_set_meta(int64_t aid, int64_t cid, const char *bvid) {
 }
 void player_set_login_cb(bool (*cb)(void)) { s_login_cb = cb; }
 void player_set_cache_cb(PlayerCacheCallback cb) { s_cache_cb = cb; }
-bool player_take_collection_request(void) {
-	bool requested = s_collection_request;
-	s_collection_request = false;
-	return requested;
+void player_set_favorite_folders(const int64_t *ids,
+                                 const char *const *titles,
+                                 const int *counts, int n) {
+	s_fav_ids = ids;
+	s_fav_titles = titles;
+	s_fav_counts = counts;
+	s_fav_n = n > 0 ? n : 0;
+}
+int64_t player_take_favorite_request(void) {
+	int64_t id = s_favorite_request;
+	s_favorite_request = 0;
+	return id;
+}
+int player_shutdown_timer_remaining(void) {
+	if (!s_shutdown_at) return 0;
+	u64 now = osGetTime();
+	if (now >= s_shutdown_at) return 1;
+	u64 ms = s_shutdown_at - now;
+	return (int)((ms + 59999u) / 60000u);
+}
+static void shutdown_timer_set(int minutes) {
+	if (minutes <= 0) s_shutdown_at = 0;
+	else s_shutdown_at = osGetTime() + (u64)minutes * 60u * 1000u;
+}
+void player_shutdown_timer_poll(void) {
+	if (!s_shutdown_at || osGetTime() < s_shutdown_at) return;
+	s_shutdown_at = 0; /* 只触发一次；失败也不能每帧狂发系统 IPC */
+	Result r = ptmSysmInit();
+	if (R_SUCCEEDED(r)) {
+		r = PTMSYSM_ShutdownAsync(0);
+		ptmSysmExit();
+	}
+	if (R_FAILED(r)) {
+		snprintf(s_toast, sizeof(s_toast), "自动关机失败:%08lx",
+		         (unsigned long)r);
+		s_toast_until = osGetTime() + 6000;
+		ui_trace("shutdown timer failed rc=%08lx", (unsigned long)r);
+	}
 }
 /* 开机时从存档恢复本模块的偏好。3D 故意不存:它按视频逐个手动开
  * (竖屏/2D 片开着 3D 只会花屏),记住上次的值弊大于利。 */
@@ -2908,9 +2947,8 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 		bool in_psettings = false;   /* 播放设置子页 */
 		bool in_comments = false;   /* 评论区子页(视频照常播) */
 		bool in_pages = false;      /* 选集子页(视频暂停,上屏留住画面) */
-		bool in_favorites = false;  /* 收藏夹选择页(视频照常播) */
-		BiliFavFolder fav_folders[64];
-		int fav_folder_n = 0;
+		bool in_favorites = false;  /* 收藏夹选择页；列表已在开播前预取 */
+		bool in_shutdown = false;   /* 定时关机选择页 */
 		/* 【选集是纯触屏页】滚动改成像素级,靠手指拖 —— 按行翻页在
 		 * 上百 P 的合集里要点几十次。摇杆和十字键在这一页**不接管**:
 		 * 它们在播放页是别的用途(方向键调进度、摇杆没占用),
@@ -2977,6 +3015,7 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 		u64 wd_t0 = osGetTime();
 		bool wd_fired = false;
 		while (aptMainLoop()) {
+			player_shutdown_timer_poll();
 			if (!wd_fired && p->dbg_decoded == 0 &&
 			    osGetTime() - wd_t0 > 6000) {
 				wd_fired = true;
@@ -3007,6 +3046,7 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				else if (in_comments) { in_comments = false; }
 				else if (in_psettings) { in_psettings = false; }
 				else if (in_favorites) { in_favorites = false; }
+				else if (in_shutdown) { in_shutdown = false; }
 				else { p->quit = 1; ret = 0; break; }
 			}
 			bool do_pause = (kDown & KEY_A) != 0;
@@ -3015,8 +3055,6 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				if (!p->pause) do_pause = true;
 			}
 			bool want_dm_input = false;
-			bool want_fav_load = false;
-			int want_fav_add = -1;
 			/* X 短按在四档倍速间循环；长按不触发短按动作，直接复原。
 			 * 把动作放在松手沿，才能可靠地区分“短按一次”和“按住”。 */
 			if (kDown & KEY_X) {
@@ -3420,20 +3458,53 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 				                 tp.px, tp.py))
 					in_comments = false;
 			} else if (in_favorites && !ui_console_active()) {
-				/* 收藏夹由账号接口实时读取；这里仅负责把目标交给 bili.c。
-				 * 视频与声音继续播放，不为了选一个文件夹退出 FFmpeg。 */
+				/* 收藏夹在开播前由 main.c 预取。播放长连接存活期间绝不再调
+				 * B 站账号接口：3DS httpc 在两条请求重叠时会偶发串响应，
+				 * 旧实现因此出现“收藏夹闪一下、播放器直接退出”。 */
 				UiRow rows[64];
 				char counts[64][24];
-				for (int i = 0; i < fav_folder_n; i++) {
+				int n = s_fav_n > 64 ? 64 : s_fav_n;
+				for (int i = 0; i < n; i++) {
 					snprintf(counts[i], sizeof(counts[i]), "%d 个视频",
-					         fav_folders[i].media_count);
-					rows[i] = (UiRow){ fav_folders[i].title, counts[i],
-					                   "点按后把当前视频收藏到这个收藏夹。" };
+					         s_fav_counts ? s_fav_counts[i] : 0);
+					rows[i] = (UiRow){ s_fav_titles[i], counts[i],
+					                   "选择后安全关闭当前流，再提交收藏。" };
 				}
-				int hit = ui_list_draw("选择收藏夹", rows, fav_folder_n, touched,
+				int hit = ui_list_draw("选择收藏夹", rows, n, touched,
 				                       (kHeld & KEY_TOUCH) != 0,
 				                       (kUp & KEY_TOUCH) != 0, tp.px, tp.py);
-				if (hit >= 0 && hit < fav_folder_n) want_fav_add = hit;
+				if (hit >= 0 && hit < n) {
+					s_favorite_request = s_fav_ids[hit];
+					snprintf(s_toast, sizeof(s_toast), "已选择:%s",
+					         s_fav_titles[hit]);
+					s_toast_until = osGetTime() + 3000;
+					/* 让 player_play 完整走自己的清理路径。main.c 会在流和
+					 * FFmpeg 都关闭后再 POST 收藏，消除竞态而不改播放逻辑。 */
+					p->quit = 1;
+					ret = 0;
+				}
+			} else if (in_shutdown && !ui_console_active()) {
+				enum { SD_15, SD_30, SD_60, SD_CANCEL, SD_N };
+				UiRow rows[SD_N];
+				rows[SD_15] = (UiRow){ "15 分钟", NULL, "15 分钟后自动关闭主机。" };
+				rows[SD_30] = (UiRow){ "30 分钟", NULL, "30 分钟后自动关闭主机。" };
+				rows[SD_60] = (UiRow){ "60 分钟", NULL, "60 分钟后自动关闭主机。" };
+				rows[SD_CANCEL] = (UiRow){ "取消定时", NULL, "清除当前关机倒计时。" };
+				int hit = ui_list_draw("定时关机", rows, SD_N, touched,
+				                       (kHeld & KEY_TOUCH) != 0,
+				                       (kUp & KEY_TOUCH) != 0, tp.px, tp.py);
+				int minutes = hit == SD_15 ? 15 : hit == SD_30 ? 30 :
+				              hit == SD_60 ? 60 : 0;
+				if (hit >= 0 && hit < SD_N) {
+					shutdown_timer_set(minutes);
+					if (minutes)
+						snprintf(s_toast, sizeof(s_toast),
+						         "将在 %d 分钟后关机", minutes);
+					else
+						snprintf(s_toast, sizeof(s_toast), "已取消定时关机");
+					s_toast_until = osGetTime() + 4000;
+					in_shutdown = false;
+				}
 			} else if (in_psettings && !ui_console_active()) { /* 播放设置子页 */
 				/* 和主设置页共用同一套列表控件:加一项只是往数组里加一行,
 				 * 不用重排布局。原来是四行两列的按钮网格,已经塞满 8 个。 */
@@ -3687,61 +3758,37 @@ static int player_play_inner(const char *url, const char *title, bool local) {
 					if (s_meta_aid && comment_count() == 0 && !comment_loading())
 						comment_load_async(s_meta_aid, 1);
 				}
-				if (ui_button(10, 139, 145, 27, "查看合集", UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) {
-					s_collection_request = true;
-					p->quit = 1;
-					ret = 0;
+				{
+					char timer_label[32];
+					int remaining = player_shutdown_timer_remaining();
+					if (remaining > 0)
+						snprintf(timer_label, sizeof(timer_label), "关机:%d分", remaining);
+					else
+						snprintf(timer_label, sizeof(timer_label), "定时关机");
+					if (ui_button(10, 139, 145, 27, timer_label, UI_COL_SEL,
+					              btn_touch, tp.px, tp.py)) {
+						in_shutdown = true;
+						ui_list_reset();
+					}
 				}
 				if (ui_button(165, 139, 145, 27, "收藏", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py)) {
-					want_fav_load = true;
+					if (s_fav_n > 0 && s_fav_ids && s_fav_titles) {
+						in_favorites = true;
+						ui_list_reset();
+					} else {
+						snprintf(s_toast, sizeof(s_toast),
+						         "未读取到收藏夹，请登录后重新播放");
+						s_toast_until = osGetTime() + 5000;
+					}
 				}
 				ui_text(10, 210, UI_SHARP, UI_COL_DIM,
 				        "A暂停  X倍速(长按复原)  B返回");
 			}
 			ui_end();
-
-			if (want_fav_load) {
-				bool can = bili_logged_in();
-				if (!can && s_login_cb) {
-					/* 扫码页可能停留很久，先暂停音画；登录完成后保持暂停，
-					 * 由用户明确点“播放”恢复。 */
-					p->pause = 1;
-					can = s_login_cb();
-				}
-				if (!can) {
-					snprintf(s_toast, sizeof(s_toast), "收藏需要先登录");
-					s_toast_until = osGetTime() + 5000;
-				} else if (bili_fav_folders(fav_folders,
-				                            (int)(sizeof(fav_folders) /
-				                                  sizeof(fav_folders[0])),
-				                            &fav_folder_n) == 0) {
-					in_favorites = true;
-					ui_list_reset();
-				} else {
-					snprintf(s_toast, sizeof(s_toast), "读取收藏夹失败:%s",
-					         bili_last_error());
-					s_toast_until = osGetTime() + 5000;
-				}
-			}
-			if (want_fav_add >= 0 && want_fav_add < fav_folder_n) {
-				/* 少数列表接口不给 aid；到真正提交时再补一次，不让每次
-				 * 播放都为一个可能不会使用的按钮多发请求。 */
-				if (!s_meta_aid && s_meta_bvid[0]) {
-					int64_t cid = s_meta_cid;
-					bili_get_cid(s_meta_bvid, &cid, &s_meta_aid);
-				}
-				if (bili_fav_add(s_meta_aid, fav_folders[want_fav_add].id) == 0) {
-					snprintf(s_toast, sizeof(s_toast), "已收藏到:%s",
-					         fav_folders[want_fav_add].title);
-					in_favorites = false;
-				} else {
-					snprintf(s_toast, sizeof(s_toast), "收藏失败:%s",
-					         bili_last_error());
-				}
-				s_toast_until = osGetTime() + 5000;
-			}
+			/* 收藏请求已经记录；立即离开输入循环，先把播放线程、NetStream
+			 * 和 FFmpeg 全部收干净，再由 main.c 提交账号接口。 */
+			if (s_favorite_request) break;
 
 			/* 字幕:等播放真正跑起来(缓冲结束)再拉,且与弹幕错开 1 秒。
 			 * 与取流/弹幕并发时,3DS httpc 会把响应发错对象 */

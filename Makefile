@@ -23,6 +23,9 @@ APP_TITLE       := bilibili
 # 版本号在 source/main.c 的 APP_VERSION,设置页和打包脚本都从那里取。
 APP_DESCRIPTION := Bilibili Homebrew Client for 3DS
 APP_AUTHOR      := Open-source community
+# HOME 菜单(CIA)和 Homebrew Launcher(3DSX)都从同一份 SMDH 取图标。
+# 明确指定，避免根目录没有 $(TARGET).png 时悄悄落回 devkitPro 默认图标。
+ICON            ?= cia/icon.png
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
