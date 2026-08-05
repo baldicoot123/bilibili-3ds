@@ -74,7 +74,7 @@ clean:
 	@rm -fr $(BUILD) $(TARGET).3dsx $(TARGET).smdh $(TARGET).elf $(TARGET).cia
 
 cia: all
-	@./tools/build_cia.sh
+	@bash ./tools/build_cia.sh
 
 else
 
