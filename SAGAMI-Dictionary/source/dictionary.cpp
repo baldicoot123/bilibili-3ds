@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <utility>
+
+#include <zlib.h>
 
 namespace {
 uint16_t read16(const uint8_t* p) {
@@ -12,28 +15,28 @@ uint16_t read16(const uint8_t* p) {
 uint32_t read32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
 }
-bool readString(FILE* f, uint16_t len, std::string& out) {
+bool readString(const std::vector<uint8_t>& data, std::size_t& cursor,
+                uint16_t len, std::string& out) {
+    if (cursor > data.size() || len > data.size() - cursor) return false;
     out.resize(len);
-    return len == 0 || std::fread(out.data(), 1, len, f) == len;
+    if (len != 0) std::memcpy(out.data(), data.data() + cursor, len);
+    cursor += len;
+    return true;
 }
 }
 
 bool Dictionary::open() {
     close();
-    dataFile_ = std::fopen("romfs:/dict/dict.bin", "rb");
-    if (!dataFile_) {
-        error_ = "无法打开 romfs:/dict/dict.bin";
+    if (!loadCompressedFile("romfs:/dict/dict.bin.gz", data_)) {
         return false;
     }
-    uint8_t header[16]{};
-    if (std::fread(header, 1, sizeof(header), dataFile_) != sizeof(header) ||
-        std::memcmp(header, "SGD1", 4) != 0) {
+    if (data_.size() < 16 || std::memcmp(data_.data(), "SGD1", 4) != 0) {
         error_ = "词条文件格式不正确";
         close();
         return false;
     }
-    if (!loadIndex("romfs:/dict/ja.idx", jaIndex_) ||
-        !loadIndex("romfs:/dict/zh.idx", zhIndex_)) {
+    if (!loadIndex("romfs:/dict/ja.idx.gz", jaIndex_) ||
+        !loadIndex("romfs:/dict/zh.idx.gz", zhIndex_)) {
         close();
         return false;
     }
@@ -42,30 +45,46 @@ bool Dictionary::open() {
 }
 
 void Dictionary::close() {
-    if (dataFile_) std::fclose(dataFile_);
-    dataFile_ = nullptr;
+    data_ = {};
     jaIndex_ = {};
     zhIndex_ = {};
 }
 
-bool Dictionary::loadIndex(const char* path, Index& index) {
-    FILE* f = std::fopen(path, "rb");
+bool Dictionary::loadCompressedFile(const char* path, std::vector<uint8_t>& out) {
+    gzFile f = gzopen(path, "rb");
     if (!f) {
-        error_ = std::string("无法打开索引：") + path;
+        error_ = std::string("无法打开压缩词库：") + path;
         return false;
     }
-    std::fseek(f, 0, SEEK_END);
-    long size = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (size < 12) {
-        std::fclose(f);
-        error_ = "索引文件过小";
+
+    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> chunk(64 * 1024);
+    for (;;) {
+        const int got = gzread(f, chunk.data(), static_cast<unsigned int>(chunk.size()));
+        if (got > 0) {
+            bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + got);
+            continue;
+        }
+        if (got < 0) {
+            int zlibError = Z_OK;
+            const char* message = gzerror(f, &zlibError);
+            error_ = std::string("解压词库失败：") + (message ? message : path);
+            gzclose(f);
+            return false;
+        }
+        break;
+    }
+    if (gzclose(f) != Z_OK) {
+        error_ = std::string("压缩词库校验失败：") + path;
         return false;
     }
-    index.bytes.resize(static_cast<std::size_t>(size));
-    bool ok = std::fread(index.bytes.data(), 1, index.bytes.size(), f) == index.bytes.size();
-    std::fclose(f);
-    if (!ok || std::memcmp(index.bytes.data(), "SGI1", 4) != 0) {
+    out = std::move(bytes);
+    return true;
+}
+
+bool Dictionary::loadIndex(const char* path, Index& index) {
+    if (!loadCompressedFile(path, index.bytes)) return false;
+    if (index.bytes.size() < 12 || std::memcmp(index.bytes.data(), "SGI1", 4) != 0) {
         error_ = "索引文件格式不正确";
         return false;
     }
@@ -101,20 +120,20 @@ int Dictionary::compareKey(const Index& index, uint32_t item,
 }
 
 bool Dictionary::readEntry(uint32_t offset, DictEntry& out) {
-    if (!dataFile_ || std::fseek(dataFile_, static_cast<long>(offset), SEEK_SET) != 0)
-        return false;
-    uint8_t lens[8];
-    if (std::fread(lens, 1, sizeof(lens), dataFile_) != sizeof(lens)) return false;
+    if (offset > data_.size() || data_.size() - offset < 8) return false;
+    std::size_t cursor = offset;
+    const uint8_t* lens = data_.data() + cursor;
+    cursor += 8;
     const uint16_t wl = read16(lens + 0);
     const uint16_t rl = read16(lens + 2);
     const uint16_t pl = read16(lens + 4);
     const uint16_t gl = read16(lens + 6);
     if (wl > 2048 || rl > 2048 || pl > 2048 || gl > 8192) return false;
     out.recordOffset = offset;
-    return readString(dataFile_, wl, out.word) &&
-           readString(dataFile_, rl, out.reading) &&
-           readString(dataFile_, pl, out.partOfSpeech) &&
-           readString(dataFile_, gl, out.gloss);
+    return readString(data_, cursor, wl, out.word) &&
+           readString(data_, cursor, rl, out.reading) &&
+           readString(data_, cursor, pl, out.partOfSpeech) &&
+           readString(data_, cursor, gl, out.gloss);
 }
 
 bool Dictionary::search(const std::string& query, SearchMode mode,

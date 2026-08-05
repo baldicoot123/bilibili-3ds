@@ -22,6 +22,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Install 3DS zlib
+        run: dkp-pacman -S --needed --noconfirm 3ds-zlib
+
       - name: Install CIA packaging tools
         run: |
           apt-get update
