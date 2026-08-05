@@ -7,7 +7,7 @@ on:
       - codex/sagami-dictionary-build
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -25,7 +25,7 @@ jobs:
       - name: Install CIA packaging tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl unzip
+          apt-get install -y --no-install-recommends ca-certificates curl gh unzip
 
           curl -fL -o /tmp/bannertool.zip \
             https://github.com/diasurgical/bannertool/releases/download/1.2.0/bannertool.zip
@@ -48,6 +48,17 @@ jobs:
           cd SAGAMI-Dictionary
           sha256sum sagami_dictionary.cia sagami_dictionary.3dsx sagami_dictionary.smdh \
             > SHA256SUMS.txt
+
+      - name: Update release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload sagami-dictionary-v0.1.0 \
+            SAGAMI-Dictionary/sagami_dictionary.cia \
+            SAGAMI-Dictionary/sagami_dictionary.3dsx \
+            SAGAMI-Dictionary/sagami_dictionary.smdh \
+            SAGAMI-Dictionary/SHA256SUMS.txt \
+            --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
