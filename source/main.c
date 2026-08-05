@@ -89,7 +89,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.6.0"
+#define APP_VERSION "1.7.0"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前
@@ -110,6 +110,13 @@ static BiliCollection s_collection_info;
 static BiliVideo s_collection_videos[CACHE_MAX_TASKS];
 static int s_collection_n = 0;
 static int s_collection_resolve_at = -1;
+#define MAX_PLAYER_FAV_FOLDERS 64
+static BiliFavFolder s_player_fav_folders[MAX_PLAYER_FAV_FOLDERS];
+static int64_t s_player_fav_ids[MAX_PLAYER_FAV_FOLDERS];
+static const char *s_player_fav_titles[MAX_PLAYER_FAV_FOLDERS];
+static int s_player_fav_counts[MAX_PLAYER_FAV_FOLDERS];
+static int s_player_fav_n = 0;
+static bool s_player_fav_loaded = false;
 /* 播放器内的缓存按钮只回调入队，不直接依赖缓存模块。这里保存本次播放
  * 对应的视频身份；播放结束立即清空，避免陈旧目标串到下一条视频。 */
 static BiliVideo *s_play_cache_video = NULL;
@@ -145,7 +152,7 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 static void busy_frame(const char *msg);   /* 定义在下面 */
 static int  run_bg(int (*fn)(void *), void *arg, const char *msg);  /* 同上 */
 static bool s_job_cancelled;   /* 上一次 run_bg 是否被 B 掐掉,定义在下面 */
-static bool play_video(BiliVideo *v);
+static void play_video(BiliVideo *v);
 static void play_selected(void);
 static void collection_page(BiliVideo *origin);
 static void page_label(const BiliPage *pg, char *out, size_t n);
@@ -161,6 +168,8 @@ static int64_t s_job_cid;
 static char *s_job_url;
 static int s_job_qn;
 static BiliVideo *s_job_video;
+static int64_t s_job_fav_aid;
+static int64_t s_job_fav_id;
 
 static int pagelist_job(void *u) {
 	(void)u;
@@ -193,6 +202,16 @@ static int collection_resolve_job(void *u) {
 	}
 	s_collection_resolve_at = -1;
 	return 0;
+}
+static int fav_folders_job(void *u) {
+	(void)u;
+	s_player_fav_n = 0;
+	return bili_fav_folders(s_player_fav_folders, MAX_PLAYER_FAV_FOLDERS,
+	                        &s_player_fav_n);
+}
+static int fav_add_job(void *u) {
+	(void)u;
+	return bili_fav_add(s_job_fav_aid, s_job_fav_id);
 }
 
 static void list_thumbs_stop(void) {
@@ -643,6 +662,7 @@ static void do_search(void) {
 
 static bool confirm_logout(void) {
 	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
 		hidScanInput();
 		u32 kd = hidKeysDown();
 		touchPosition tp = { 0, 0 };
@@ -674,6 +694,9 @@ static void do_login(void) {
 	if (bili_logged_in()) {
 		if (confirm_logout()) {
 			bili_logout();
+			s_player_fav_n = 0;
+			s_player_fav_loaded = false;
+			player_set_favorite_folders(NULL, NULL, NULL, 0);
 			set_status("已注销", "logged out");
 		} else {
 			set_status("已取消注销", "logout cancelled");
@@ -699,6 +722,7 @@ static void do_login(void) {
 	s_pending_mode = -1;   /* 清掉上次残留,否则会污染本次结果 */
 	u64 last_poll = 0;
 	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
 		/* 一帧只能 scan 一次!scan 两次会把触摸的"按下沿"吃掉
 		 * (第二次 kDown 已经变 0),表现为下屏按钮完全点不动 */
 		hidScanInput();
@@ -746,6 +770,7 @@ static void do_login(void) {
 					 * 以前这里无条件报「登录成功」,于是出问题时屏幕说成功、
 					 * 顶栏说未登录 —— 提示本身在骗人,白白多查了一轮 */
 					if (bili_logged_in()) {
+						s_player_fav_loaded = false;
 						set_status("登录成功", "login OK");
 					} else {
 						set_status("登录未生效,请重试", "login failed: cookies rejected");
@@ -813,6 +838,7 @@ static int run_bg(int (*fn)(void *), void *arg, const char *msg) {
 	bool cancelling = false;
 	s_job_cancelled = false;
 	while (!job.done && aptMainLoop()) {
+		player_shutdown_timer_poll();
 		hidScanInput();
 		/* 【B 取消】httpc 的请求既没有超时也不看标志位,唯一能中断它的
 		 * 办法是从外面把连接掐掉 —— net_cancel_streams 就是干这个的
@@ -870,11 +896,72 @@ static bool login_cb(void) {
 	return bili_logged_in();
 }
 
+/* 收藏夹必须在播放器建立长连接前读取。播放中再调账号 API 会与视频流
+ * 共用 3DS httpc，旧实现偶发拿错响应，表现为列表闪现后播放器退出。 */
+static void player_favorites_prepare(void) {
+	if (!bili_logged_in()) {
+		s_player_fav_n = 0;
+		s_player_fav_loaded = false;
+		player_set_favorite_folders(NULL, NULL, NULL, 0);
+		return;
+	}
+	if (!s_player_fav_loaded) {
+		if (run_bg(fav_folders_job, NULL, "读取收藏夹") == 0) {
+			for (int i = 0; i < s_player_fav_n; i++) {
+				s_player_fav_ids[i] = s_player_fav_folders[i].id;
+				s_player_fav_titles[i] = s_player_fav_folders[i].title;
+				s_player_fav_counts[i] = s_player_fav_folders[i].media_count;
+			}
+			s_player_fav_loaded = true;
+		} else {
+			s_player_fav_n = 0;
+			s_player_fav_loaded = false; /* 下次播放重试，不缓存一次失败 */
+		}
+		s_busy[0] = 0;
+	}
+	player_set_favorite_folders(s_player_fav_ids, s_player_fav_titles,
+	                            s_player_fav_counts, s_player_fav_n);
+}
+
+/* player_play 已经返回、NetStream 和 FFmpeg 都已关闭后才允许 POST。 */
+static bool submit_player_favorite(BiliVideo *v) {
+	int64_t folder_id = player_take_favorite_request();
+	if (!folder_id) return false;
+	if (!v || !bili_logged_in()) {
+		snprintf(s_busy, sizeof(s_busy), "收藏失败:账号未登录");
+		return true;
+	}
+	if (!v->aid) {
+		s_job_video = v;
+		if (run_bg(video_cid_job, NULL, "补充视频信息") != 0 || !v->aid) {
+			snprintf(s_busy, sizeof(s_busy), "收藏失败:%s", bili_last_error());
+			return true;
+		}
+	}
+	const char *folder_name = "收藏夹";
+	for (int i = 0; i < s_player_fav_n; i++)
+		if (s_player_fav_ids[i] == folder_id) {
+			folder_name = s_player_fav_titles[i];
+			break;
+		}
+	s_job_fav_aid = v->aid;
+	s_job_fav_id = folder_id;
+	if (run_bg(fav_add_job, NULL, "提交收藏") == 0) {
+		snprintf(s_busy, sizeof(s_busy), "已收藏到:%s", folder_name);
+		/* 数量已变化，下次播放前重新读取，避免显示旧计数。 */
+		s_player_fav_loaded = false;
+	} else {
+		snprintf(s_busy, sizeof(s_busy), "收藏失败:%s", bili_last_error());
+	}
+	return true;
+}
+
 /* 在线播放和本地播放都优先于后台下载。只有确认缓存 NetStream 已经关闭，
  * 才让播放器建立自己的输入，避免 3DS httpc 同时跑两条长流。 */
 static bool cache_enter_foreground(const char *why) {
 	download_worker_set_foreground(true);
 	while (download_worker_is_active() && aptMainLoop()) {
+		player_shutdown_timer_poll();
 		if (net_is_shutting_down() || aptShouldClose()) return false;
 		busy_frame(why ? why : "暂停后台缓存");
 	}
@@ -1084,6 +1171,7 @@ static void cache_list_page(void) {
 	int sel = 0;
 	char notice[128] = "";
 	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
 		hidScanInput();
 		u32 kd = hidKeysDown();
 		int n = cache_manager_snapshot(s_cache_view, CACHE_MAX_TASKS);
@@ -1144,6 +1232,7 @@ static void cache_list_page(void) {
  * 将要处理的真实数量。 */
 static void collection_page(BiliVideo *origin) {
 	if (!s_net_ok || !origin || !origin->bvid[0]) return;
+	if (!cache_enter_foreground("暂停后台缓存")) return;
 	list_thumbs_stop();
 	s_collection_n = 0;
 	s_job_bvid = origin->bvid;
@@ -1151,6 +1240,7 @@ static void collection_page(BiliVideo *origin) {
 	    s_collection_n <= 0) {
 		snprintf(s_busy, sizeof(s_busy), "读取合集失败:%s", bili_last_error());
 		if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
+		cache_leave_foreground();
 		return;
 	}
 
@@ -1159,6 +1249,7 @@ static void collection_page(BiliVideo *origin) {
 		if (!strcmp(s_collection_videos[i].bvid, origin->bvid)) { sel = i; break; }
 	char notice[160] = "";
 	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
 		hidScanInput();
 		u32 kd = hidKeysDown();
 		touchPosition tp = { 0, 0 };
@@ -1257,12 +1348,13 @@ static void collection_page(BiliVideo *origin) {
 		}
 		if (tasks) cache_list_page();
 		if (play || (kd & KEY_A)) {
-			(void)play_video(&s_collection_videos[sel]);
+			play_video(&s_collection_videos[sel]);
 			list_thumbs_stop();
 		}
 		if (net_is_shutting_down() || aptShouldClose()) break;
 	}
 	if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
+	cache_leave_foreground();
 }
 
 /* 分P 一行的显示文本:"P3  标题"(没标题就只有 "P3") */
@@ -1360,12 +1452,11 @@ static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
 	sub_free();
 }
 
-static bool play_video(BiliVideo *v) {
-	if (!s_net_ok) { load_list(); return false; }
-	if (!v || !v->bvid[0]) return false;
-	bool open_collection = false;
-	/* 清掉上一次已消费场景外可能遗留的请求。 */
-	(void)player_take_collection_request();
+static void play_video(BiliVideo *v) {
+	if (!s_net_ok) { load_list(); return; }
+	if (!v || !v->bvid[0]) return;
+	/* 清掉上一次异常退出可能遗留的收藏请求。 */
+	(void)player_take_favorite_request();
 
 	/* 第一件事:停掉封面下载线程。
 	 * 它们是唯一绕过 net 串行锁的请求(net_get_img),留着的话
@@ -1374,6 +1465,7 @@ static bool play_video(BiliVideo *v) {
 	 * "第一次进某视频字幕是别的视频的,退出等一会儿再进就正常"
 	 * (等的那会儿封面刚好下完,并发消失) */
 	list_thumbs_stop();
+	player_favorites_prepare();
 
 	if (v->cid == 0) {
 		set_status("获取视频信息...", "fetching cid...");
@@ -1388,7 +1480,7 @@ static bool play_video(BiliVideo *v) {
 			         (why && why[0]) ? why : "获取 cid 失败");
 			set_status(msg, "get cid failed (see console)");
 			snprintf(s_busy, sizeof(s_busy), "%s", msg);  /* 状态条留原因 */
-			return false;
+			return;
 		}
 	}
 	/* ---- 分 P ----
@@ -1434,10 +1526,7 @@ static bool play_video(BiliVideo *v) {
 				         s_pages[cur].page, v->title);
 			player_set_pages(s_pg_labelp, s_pg_dur, s_npages, cur);
 			play_stream(v, s_pages[cur].cid, t);
-			if (player_take_collection_request()) {
-				open_collection = true;
-				break;
-			}
+			if (submit_player_favorite(v)) break;
 			/* 【只有在选集里挑了才继续】按 B 退出播放器是「我看完了」,
 			 * 不是「我要挑下一集」—— 以前播完无条件弹选集页,
 			 * 想走的人得按两次 B。 */
@@ -1460,7 +1549,7 @@ static bool play_video(BiliVideo *v) {
 		s_busy_minimal = false;
 	} else {
 		play_stream(v, v->cid, v->title);
-		open_collection = player_take_collection_request();
+		(void)submit_player_favorite(v);
 	}
 	player_set_pages(NULL, NULL, 0, 0);
 
@@ -1469,14 +1558,12 @@ static bool play_video(BiliVideo *v) {
 	 * "Closing software"。 */
 	if (s_count > 0 && !net_is_shutting_down()) list_thumbs_start(s_sel);
 	ui_trace_sync("exit-path: play_video done");
-	return open_collection;
 }
 
 static void play_selected(void) {
 	if (s_sel < 0 || s_sel >= s_count) return;
 	BiliVideo *v = &s_list[s_sel];
-	if (play_video(v) && !net_is_shutting_down() && !aptShouldClose())
-		collection_page(v);
+	play_video(v);
 }
 
 /* APT 事件回调(HOME/睡眠/退出)。只做置标志这类轻活,别在回调里干重活 */
@@ -1579,6 +1666,7 @@ int main(void) {
 
 
 	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
 		hidScanInput();
 		u32 kDown = hidKeysDown();
 		(void)0; /* kRepeat 已弃用:上下键改为 单击+长按连续滚动 */
