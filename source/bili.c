@@ -597,6 +597,46 @@ int bili_history(int page, BiliVideo *out, int max, int *count) {
 	return (n >= 0) ? 0 : -1;
 }
 
+/* “稍后再看”清单。3DS 界面把入口命名为“现在就看”，数据仍直接来自
+ * 账号的 toview 清单，不在本地复制，因此手机/网页端添加后可直接看到。
+ * 2026 年的 web 端点要求 WBI；viewed=0 表示全部，pn/ps 负责分页。 */
+int bili_toview(int page, BiliVideo *out, int max, int *count) {
+	*count = 0;
+	if (!out || max <= 0) return -1;
+	if (!s_logged_in || !s_mixin[0]) {
+		if (fetch_nav() != 0) return -1;
+	}
+	if (!s_logged_in) {
+		snprintf(s_last_err, sizeof(s_last_err), "请先登录");
+		return -1;
+	}
+	char pn[12];
+	snprintf(pn, sizeof(pn), "%d", page < 1 ? 1 : page);
+	const char *keys[] = { "asc", "key", "need_split", "pn", "ps",
+	                       "viewed", "web_location" };
+	const char *vals[] = { "false", "", "true", pn, "20", "0", "333.881" };
+	char query[640];
+	if (wbi_sign(keys, vals, 7, s_mixin, net_now(),
+	             query, sizeof(query)) != 0)
+		return -1;
+	char url[768];
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/v2/history/toview/web?%s", query);
+	char *body = NULL;
+	Json *j = api_get(url, &body);
+	if (!j) return -1;
+	int arr = json_find(j, -1, "data.list");
+	int n = json_arr_len(j, arr);
+	for (int i = 0; i < n && *count < max; i++) {
+		int el = json_arr_at(j, arr, i);
+		parse_video_item(j, el, &out[*count], false);
+		if (out[*count].bvid[0] && out[*count].title[0]) (*count)++;
+	}
+	json_free(j);
+	free(body);
+	return (n >= 0) ? 0 : -1;
+}
+
 /* 收藏夹(默认收藏夹,需登录)。两步:查默认夹 id → 拉内容 */
 static int64_t s_fav_fid = 0;
 static bool s_sub_is_ai = false;
