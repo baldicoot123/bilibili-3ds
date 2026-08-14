@@ -57,7 +57,7 @@ unsigned int __stacksize__ = 256 * 1024;
 u32 __ctru_linear_heap_size = 25 * 1024 * 1024;
 
 typedef enum { MODE_POPULAR, MODE_RECOMMEND, MODE_SEARCH,
-               MODE_HISTORY, MODE_FAV } ListMode;
+               MODE_HISTORY, MODE_FAV, MODE_TOVIEW } ListMode;
 
 static BiliVideo s_list[MAX_LIST];
 /* 【为什么要多一份 10KB 的暂存】接口层一进来就把 *count 清零、再逐条填,
@@ -89,7 +89,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.7.0"
+#define APP_VERSION "1.8.0"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前
@@ -256,6 +256,7 @@ static int list_fetch_job(void *unused) {
 	case MODE_RECOMMEND: return bili_recommend(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	case MODE_HISTORY: return bili_history(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	case MODE_FAV:     return bili_fav(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	case MODE_TOVIEW:  return bili_toview(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	default:           return bili_popular(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	}
 }
@@ -383,7 +384,10 @@ static void load_list(void) {
 	} else {
 		char buf[64];
 		snprintf(buf, sizeof(buf), "loaded page %d, %d items", s_page, s_count);
-		set_status("", buf);
+		if (s_mode == MODE_TOVIEW && s_count == 0)
+			set_status("稍后再看清单为空", buf);
+		else
+			set_status("", buf);
 		if (append && s_page_end && s_page >= s_page_end) {
 			if (!s_busy[0]) snprintf(s_busy, sizeof(s_busy), "没有更多新内容");
 		} else {
@@ -491,15 +495,20 @@ static void draw_list(void) {
 }
 
 typedef struct {
-	bool login, settings, hist, fav, popular, recommend, search;
+	bool login, settings, hist, fav, toview, popular, recommend, search;
 	bool cache, parts, downloads;
 } ListActions;
 
 static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act) {
 	ui_begin_bottom();
 	ui_text(10, 4, UI_SHARP, UI_COL_TEXT, bili_logged_in() ? "已登录" : "未登录");
-	if (s_count == 0)
-		ui_text(108, 4, UI_SHARP, UI_COL_ACCENT, "加载失败?按 A 重试");
+	if (s_count == 0) {
+		const char *hint = !strcmp(s_status, "加载中...") ? "加载中..." :
+		                   (s_mode == MODE_TOVIEW &&
+		                    !strcmp(s_status, "稍后再看清单为空")) ? "清单为空" :
+		                   "加载失败?按 A 重试";
+		ui_text(108, 4, UI_SHARP, UI_COL_ACCENT, hint);
+	}
 	{	/* 底部状态条:在做什么 + 总进度 */
 		int done = 0, total = 0;
 		bool busy = thumb_progress(&done, &total);
@@ -562,7 +571,13 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 	if (ui_button(214, 112, 96, 36, "查看合集", UI_COL_SEL,
 	              touched, tx, ty))
 		act->parts = true;
-	if (ui_button(10, 154, 300, 36, "离线下载任务", UI_COL_SEL,
+	if (ui_button(10, 154, 145, 36, "现在就看",
+	              hl == MODE_TOVIEW ? UI_COL_ACCENT : UI_COL_SEL,
+	              touched, tx, ty)) {
+		act->toview = true;
+		s_hl_mode = MODE_TOVIEW;
+	}
+	if (ui_button(165, 154, 145, 36, "离线下载任务", UI_COL_SEL,
 	              touched, tx, ty))
 		act->downloads = true;
 }
@@ -742,8 +757,8 @@ static void do_login(void) {
 		if (!ui_console_active())
 			draw_bottom_list(touched, tp.px, tp.py, &act);
 		ui_end();
-		if (act.popular || act.recommend || act.hist || act.fav) {
-			/* 历史/收藏仍需登录,登录未完成时点它们无意义 → 只接受热门/推荐 */
+		if (act.popular || act.recommend || act.hist || act.fav || act.toview) {
+			/* 账号列表仍需登录,登录未完成时点它们无意义 → 只接受热门/推荐 */
 			if (act.popular || act.recommend) {
 				s_pending_mode = act.popular ? MODE_POPULAR : MODE_RECOMMEND;
 				set_status("已取消登录", "login cancelled");
@@ -1749,7 +1764,7 @@ int main(void) {
 			 * 原有条目、选中项和滚动位置全部保留。 */
 			bool endless = s_mode == MODE_RECOMMEND ||
 			               s_mode == MODE_POPULAR || s_mode == MODE_HISTORY ||
-			               s_mode == MODE_FAV;
+			               s_mode == MODE_FAV || s_mode == MODE_TOVIEW;
 			int last_visible = (int)((s_scroll_t + LIST_H) / ROW_H);
 			if (!s_in_settings && !(kDown & KEY_R) && endless &&
 			    s_count > 0 && s_count < MAX_LIST &&
@@ -1778,7 +1793,7 @@ int main(void) {
 		}
 		if ((kDown & (KEY_ZL | KEY_ZR)) ||
 		    ((kDown & KEY_SELECT) && !(hidKeysHeld() & KEY_START))) {
-			/* 频道循环只含 热门↔推荐;历史/收藏走下屏独立按钮。
+			/* 频道循环只含 热门↔推荐;账号列表走下屏独立按钮。
 			 * SELECT 与 ZL/ZR 同功能,照顾没有 ZL/ZR 的老机型 */
 			s_mode = (s_mode == MODE_POPULAR) ? MODE_RECOMMEND : MODE_POPULAR;
 			s_hl_mode = -1;
@@ -1893,8 +1908,9 @@ int main(void) {
 			s_hl_mode = -1;
 			if (s_mode != MODE_RECOMMEND) { s_mode = MODE_RECOMMEND; s_page = 1; load_list(); }
 		}
-		if (act.hist || act.fav) {
-			ListMode want = act.hist ? MODE_HISTORY : MODE_FAV;
+		if (act.hist || act.fav || act.toview) {
+			ListMode want = act.hist ? MODE_HISTORY :
+			                act.fav ? MODE_FAV : MODE_TOVIEW;
 			if (!bili_logged_in())
 				do_login();          /* 未登录:直接拉起扫码 */
 			if (s_pending_mode >= 0) {           /* 登录界面里改去别的频道 */

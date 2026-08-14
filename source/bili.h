@@ -72,9 +72,10 @@ int bili_popular(int page, BiliVideo *out, int max, int *count);
 /* 首页推荐(登录后个性化) */
 int bili_recommend(int page, BiliVideo *out, int max, int *count);
 
-/* 历史记录 / 默认收藏夹(均需登录) */
+/* 历史记录 / 默认收藏夹 / 稍后再看(均需登录) */
 int bili_history(int page, BiliVideo *out, int max, int *count);
 int bili_fav(int page, BiliVideo *out, int max, int *count);
+int bili_toview(int page, BiliVideo *out, int max, int *count);
 /* 当前账号创建的收藏夹，以及把一个视频收藏到指定收藏夹。 */
 int bili_fav_folders(BiliFavFolder *out, int max, int *count);
 int bili_fav_add(int64_t aid, int64_t folder_id);
