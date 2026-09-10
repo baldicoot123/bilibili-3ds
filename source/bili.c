@@ -637,31 +637,25 @@ int bili_toview(int page, BiliVideo *out, int max, int *count) {
 	return (n >= 0) ? 0 : -1;
 }
 
-/* 收藏夹(默认收藏夹,需登录)。两步:查默认夹 id → 拉内容 */
+/* 收藏夹(需登录)。旧入口仍保留“第一个收藏夹”的兼容行为；主页的新两级
+ * 界面会先调用 bili_fav_folders()，再把用户选择的 id 交给
+ * bili_fav_folder()，这样不会悄悄把所有“收藏”都指向默认夹。 */
 static int64_t s_fav_fid = 0;
 static bool s_sub_is_ai = false;
-int bili_fav(int page, BiliVideo *out, int max, int *count) {
-	*count = 0;
-	if (!s_mid && fetch_nav() != 0) return -1;
-	if (!s_mid) return -1;
-	char midstr[24], url[224];
-	i64_to_str(s_mid, midstr);
-	if (!s_fav_fid) {
-		snprintf(url, sizeof(url),
-		         "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=%s",
-		         midstr);
-		char *body = NULL;
-		Json *j = api_get(url, &body);
-		if (!j) return -1;
-		int arr = json_find(j, -1, "data.list");
-		if (json_arr_len(j, arr) > 0)
-			json_get_int(j, json_arr_at(j, arr, 0), "id", &s_fav_fid);
-		json_free(j);
-		free(body);
-		if (!s_fav_fid) return -1;
+int bili_fav_folder(int64_t folder_id, int page,
+                    BiliVideo *out, int max, int *count) {
+	if (!out || !count || max <= 0 || folder_id <= 0 || page <= 0) {
+		snprintf(s_last_err, sizeof(s_last_err), "收藏夹参数无效");
+		return -1;
 	}
+	*count = 0;
+	if (!s_logged_in) {
+		snprintf(s_last_err, sizeof(s_last_err), "请先登录");
+		return -1;
+	}
+	char url[224];
 	char fidstr[24];
-	i64_to_str(s_fav_fid, fidstr);
+	i64_to_str(folder_id, fidstr);
 	snprintf(url, sizeof(url),
 	         "https://api.bilibili.com/x/v3/fav/resource/list?"
 	         "media_id=%s&pn=%d&ps=20&platform=web", fidstr, page);
@@ -694,6 +688,22 @@ int bili_fav(int page, BiliVideo *out, int max, int *count) {
 	json_free(j);
 	free(body);
 	return 0;
+}
+
+int bili_fav(int page, BiliVideo *out, int max, int *count) {
+	if (!s_mid && fetch_nav() != 0) return -1;
+	if (!s_mid || !s_logged_in) {
+		snprintf(s_last_err, sizeof(s_last_err), "请先登录");
+		return -1;
+	}
+	if (!s_fav_fid) {
+		BiliFavFolder first;
+		int n = 0;
+		if (bili_fav_folders(&first, 1, &n) != 0 || n <= 0)
+			return -1;
+		s_fav_fid = first.id;
+	}
+	return bili_fav_folder(s_fav_fid, page, out, max, count);
 }
 
 int bili_fav_folders(BiliFavFolder *out, int max, int *count) {
