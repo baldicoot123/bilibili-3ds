@@ -89,7 +89,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.8.0"
+#define APP_VERSION "1.9.0"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前
@@ -117,6 +117,10 @@ static const char *s_player_fav_titles[MAX_PLAYER_FAV_FOLDERS];
 static int s_player_fav_counts[MAX_PLAYER_FAV_FOLDERS];
 static int s_player_fav_n = 0;
 static bool s_player_fav_loaded = false;
+/* 主页收藏采用两级导航：先选收藏夹，再按这个 id 拉视频。与播放器内
+ * “添加到收藏夹”的状态分开保存，避免一次浏览选择改变播放器行为。 */
+static int64_t s_home_fav_id = 0;
+static char s_home_fav_title[96] = {0};
 /* 播放器内的缓存按钮只回调入队，不直接依赖缓存模块。这里保存本次播放
  * 对应的视频身份；播放结束立即清空，避免陈旧目标串到下一条视频。 */
 static BiliVideo *s_play_cache_video = NULL;
@@ -255,7 +259,8 @@ static int list_fetch_job(void *unused) {
 	case MODE_SEARCH:  return bili_search(s_keyword, s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	case MODE_RECOMMEND: return bili_recommend(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	case MODE_HISTORY: return bili_history(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
-	case MODE_FAV:     return bili_fav(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
+	case MODE_FAV:     return bili_fav_folder(s_home_fav_id, s_page,
+	                                        s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	case MODE_TOVIEW:  return bili_toview(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	default:           return bili_popular(s_page, s_stage, LIST_PAGE_SIZE, &s_stage_n);
 	}
@@ -386,6 +391,12 @@ static void load_list(void) {
 		snprintf(buf, sizeof(buf), "loaded page %d, %d items", s_page, s_count);
 		if (s_mode == MODE_TOVIEW && s_count == 0)
 			set_status("稍后再看清单为空", buf);
+		else if (s_mode == MODE_FAV && s_count == 0) {
+			char empty[160];
+			snprintf(empty, sizeof(empty), "%s为空",
+			         s_home_fav_title[0] ? s_home_fav_title : "收藏文件夹");
+			set_status(empty, buf);
+		}
 		else
 			set_status("", buf);
 		if (append && s_page_end && s_page >= s_page_end) {
@@ -506,6 +517,8 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 		const char *hint = !strcmp(s_status, "加载中...") ? "加载中..." :
 		                   (s_mode == MODE_TOVIEW &&
 		                    !strcmp(s_status, "稍后再看清单为空")) ? "清单为空" :
+		                   (s_mode == MODE_FAV &&
+		                    strstr(s_status, "为空")) ? "文件夹为空" :
 		                   "加载失败?按 A 重试";
 		ui_text(108, 4, UI_SHARP, UI_COL_ACCENT, hint);
 	}
@@ -711,6 +724,8 @@ static void do_login(void) {
 			bili_logout();
 			s_player_fav_n = 0;
 			s_player_fav_loaded = false;
+			s_home_fav_id = 0;
+			s_home_fav_title[0] = 0;
 			player_set_favorite_folders(NULL, NULL, NULL, 0);
 			set_status("已注销", "logged out");
 		} else {
@@ -901,6 +916,92 @@ static void busy_frame(const char *msg) {
 	ui_end();
 }
 
+static void remember_favorite_folders_for_player(void) {
+	for (int i = 0; i < s_player_fav_n; i++) {
+		s_player_fav_ids[i] = s_player_fav_folders[i].id;
+		s_player_fav_titles[i] = s_player_fav_folders[i].title;
+		s_player_fav_counts[i] = s_player_fav_folders[i].media_count;
+	}
+	s_player_fav_loaded = true;
+}
+
+/* 主页“收藏”的第一级。这里仅显示账号创建的收藏夹；用户点中后，主列表
+ * 才切到 MODE_FAV 并读取那个文件夹的内容。上屏刻意不用彩色标题条，保留
+ * 之前精简首页标题后的可视面积；下屏列表支持滑动和点按。 */
+static bool favorite_folders_page(void) {
+	if (!bili_logged_in()) return false;
+	list_thumbs_stop();
+	ui_list_reset();
+
+	if (run_bg(fav_folders_job, NULL, "读取收藏文件夹") != 0) {
+		if (!s_job_cancelled)
+			snprintf(s_busy, sizeof(s_busy), "读取收藏文件夹失败:%s",
+			         bili_last_error());
+		else
+			s_busy[0] = 0;
+		ui_list_reset();
+		if (!net_is_shutting_down() && s_count > 0) list_thumbs_start(s_sel);
+		return false;
+	}
+	remember_favorite_folders_for_player();
+	s_busy[0] = 0;
+
+	UiRow rows[MAX_PLAYER_FAV_FOLDERS];
+	char counts[MAX_PLAYER_FAV_FOLDERS][24];
+	for (int i = 0; i < s_player_fav_n; i++) {
+		snprintf(counts[i], sizeof(counts[i]), "%d 个视频",
+		         s_player_fav_folders[i].media_count);
+		rows[i] = (UiRow){ s_player_fav_folders[i].title, counts[i], NULL };
+	}
+
+	bool chosen = false;
+	while (aptMainLoop()) {
+		player_shutdown_timer_poll();
+		hidScanInput();
+		u32 kd = hidKeysDown();
+		if (kd & KEY_B) break;
+		if (net_is_shutting_down() || aptShouldClose()) break;
+
+		bool touched = (kd & KEY_TOUCH) != 0;
+		bool holding = (hidKeysHeld() & KEY_TOUCH) != 0;
+		bool released = (hidKeysUp() & KEY_TOUCH) != 0;
+		touchPosition tp = { 0, 0 };
+		if (holding) hidTouchRead(&tp);
+
+		ui_begin();
+		ui_text(16, 16, UI_SHARP, UI_COL_TEXT, "选择收藏文件夹");
+		int f = ui_list_focus();
+		if (f >= 0 && f < s_player_fav_n) {
+			ui_text_clipped(16, 58, 0.9f, UI_COL_WHITE,
+			                s_player_fav_folders[f].title, 368);
+			char info[64];
+			snprintf(info, sizeof(info), "里面有 %d 个视频",
+			         s_player_fav_folders[f].media_count);
+			ui_text(16, 94, UI_SHARP, UI_COL_DIM, info);
+		} else {
+			ui_text(16, 58, UI_SHARP, UI_COL_DIM,
+			        "在下屏选择分类文件夹，再查看具体内容。");
+		}
+		ui_text(16, 206, UI_SHARP, UI_COL_DIM, "B 返回主页");
+		int picked = ui_list_draw("收藏文件夹", rows, s_player_fav_n,
+		                          touched, holding, released, tp.px, tp.py);
+		ui_end();
+
+		if (picked >= 0 && picked < s_player_fav_n) {
+			s_home_fav_id = s_player_fav_folders[picked].id;
+			snprintf(s_home_fav_title, sizeof(s_home_fav_title), "%s",
+			         s_player_fav_folders[picked].title);
+			chosen = true;
+			break;
+		}
+	}
+
+	ui_list_reset();
+	if (!chosen && !net_is_shutting_down() && s_count > 0)
+		list_thumbs_start(s_sel);
+	return chosen;
+}
+
 /* 播放器发弹幕时的登录回调:未登录则拉起扫码流程 */
 static bool login_cb(void) {
 	if (!bili_logged_in())
@@ -922,12 +1023,7 @@ static void player_favorites_prepare(void) {
 	}
 	if (!s_player_fav_loaded) {
 		if (run_bg(fav_folders_job, NULL, "读取收藏夹") == 0) {
-			for (int i = 0; i < s_player_fav_n; i++) {
-				s_player_fav_ids[i] = s_player_fav_folders[i].id;
-				s_player_fav_titles[i] = s_player_fav_folders[i].title;
-				s_player_fav_counts[i] = s_player_fav_folders[i].media_count;
-			}
-			s_player_fav_loaded = true;
+			remember_favorite_folders_for_player();
 		} else {
 			s_player_fav_n = 0;
 			s_player_fav_loaded = false; /* 下次播放重试，不缓存一次失败 */
@@ -1908,9 +2004,8 @@ int main(void) {
 			s_hl_mode = -1;
 			if (s_mode != MODE_RECOMMEND) { s_mode = MODE_RECOMMEND; s_page = 1; load_list(); }
 		}
-		if (act.hist || act.fav || act.toview) {
-			ListMode want = act.hist ? MODE_HISTORY :
-			                act.fav ? MODE_FAV : MODE_TOVIEW;
+		if (act.hist || act.toview) {
+			ListMode want = act.hist ? MODE_HISTORY : MODE_TOVIEW;
 			if (!bili_logged_in())
 				do_login();          /* 未登录:直接拉起扫码 */
 			if (s_pending_mode >= 0) {           /* 登录界面里改去别的频道 */
@@ -1924,6 +2019,21 @@ int main(void) {
 				load_list();
 			}
 			s_hl_mode = -1;   /* 结束:高亮回落到真实频道 */
+		}
+		if (act.fav) {
+			if (!bili_logged_in())
+				do_login();          /* 未登录:先扫码，再显示文件夹 */
+			if (s_pending_mode >= 0) {       /* 登录页里改去了热门/推荐 */
+				s_mode = (ListMode)s_pending_mode;
+				s_pending_mode = -1;
+				s_page = 1;
+				load_list();
+			} else if (bili_logged_in() && favorite_folders_page()) {
+				s_mode = MODE_FAV;
+				s_page = 1;
+				load_list();
+			}
+			s_hl_mode = -1;
 		}
 	}
 
