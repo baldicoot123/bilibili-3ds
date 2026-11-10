@@ -89,7 +89,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.9.1"
+#define APP_VERSION "1.9.2"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前
@@ -270,7 +270,7 @@ static void load_list(void) {
 	bool append = s_page > 1 && s_count > 0;
 	if (!s_net_ok) {
 		if (!append) s_count = 0;
-		set_status("网络未就绪(A 重试 / 可打开离线下载任务)",
+		set_status("网络未就绪(A 重试 / 可打开本地已缓存)",
 		           "network unavailable; A=retry");
 		snprintf(s_busy, sizeof(s_busy), "网络初始化失败，离线缓存仍可播放");
 		return;
@@ -590,7 +590,7 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 		act->toview = true;
 		s_hl_mode = MODE_TOVIEW;
 	}
-	if (ui_button(165, 154, 145, 36, "离线下载任务", UI_COL_SEL,
+	if (ui_button(165, 154, 145, 36, "本地已缓存", UI_COL_SEL,
 	              touched, tx, ty))
 		act->downloads = true;
 }
@@ -1102,10 +1102,10 @@ static void cache_duplicate_message(const char *bvid, int64_t cid,
 		snprintf(out, outlen, "该视频已在待缓存队列");
 		break;
 	case DOWNLOAD_STATUS_PAUSED:
-		snprintf(out, outlen, "该视频已有暂停任务，请到离线下载任务继续");
+		snprintf(out, outlen, "该视频已有暂停任务，请到本地已缓存继续");
 		break;
 	case DOWNLOAD_STATUS_FAILED:
-		snprintf(out, outlen, "该视频已有失败任务，请到离线下载任务重试");
+		snprintf(out, outlen, "该视频已有失败任务，请到本地已缓存重试");
 		break;
 	default:
 		snprintf(out, outlen, "该视频已有缓存任务，不会重复加入");
@@ -1227,10 +1227,10 @@ static void draw_cache_page(int sel, const char *notice) {
 	int n = cache_manager_snapshot(s_cache_view, CACHE_MAX_TASKS);
 	ui_begin();
 	char head[48];
-	snprintf(head, sizeof(head), "离线缓存  %d/%d", n ? sel + 1 : 0, n);
+	snprintf(head, sizeof(head), "本地已缓存  %d/%d", n ? sel + 1 : 0, n);
 	ui_text(6, 3, 0.7f, UI_COL_DIM, head);
 	if (!n) {
-		ui_text(112, 104, UI_SHARP, UI_COL_DIM, "还没有缓存任务");
+		ui_text(112, 104, UI_SHARP, UI_COL_DIM, "还没有本地缓存");
 	} else {
 		int first = sel - 3;
 		if (first < 0) first = 0;
@@ -1257,7 +1257,7 @@ static void draw_cache_page(int sel, const char *notice) {
 	}
 
 	ui_begin_bottom();
-	ui_text(10, 8, UI_SHARP, UI_COL_TEXT, "缓存管理");
+	ui_text(10, 8, UI_SHARP, UI_COL_TEXT, "本地缓存管理");
 	if (n) {
 		ui_text_clipped(10, 38, UI_SHARP, UI_COL_WHITE,
 		                s_cache_view[sel].title, 300);

@@ -614,9 +614,8 @@ int bili_toview(int page, BiliVideo *out, int max, int *count) {
 	snprintf(pn, sizeof(pn), "%d", page < 1 ? 1 : page);
 	const char *keys[] = { "asc", "key", "need_split", "pn", "ps",
 	                       "viewed", "web_location" };
-	/* “现在就看”按新加入优先显示：实体机实测该端点 asc=true
-	 * 返回最新加入 -> 最早加入；分页仍由服务端维持这个全局顺序。 */
-	const char *vals[] = { "true", "", "true", pn, "20", "0", "333.881" };
+	/* 保持 B 站“稍后再看”的原有顺序。 */
+	const char *vals[] = { "false", "", "true", pn, "20", "0", "333.881" };
 	char query[640];
 	if (wbi_sign(keys, vals, 7, s_mixin, net_now(),
 	             query, sizeof(query)) != 0)

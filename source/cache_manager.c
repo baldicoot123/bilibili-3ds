@@ -430,7 +430,11 @@ int cache_manager_snapshot(DownloadTask *out, int max) {
 	if (!out || max <= 0) return 0;
 	LightLock_Lock(&s_lock);
 	int n = s_count < max ? s_count : max;
-	memcpy(out, s_tasks, (size_t)n * sizeof(*out));
+	/* s_tasks 只在尾部追加，因此内部天然是最早 -> 最新。界面需要最新
+	 * 缓存排最前，但 worker 的 claim_next 仍必须维持 FIFO；只反转快照，
+	 * 不修改持久化顺序和下载调度。 */
+	for (int i = 0; i < n; i++)
+		out[i] = s_tasks[s_count - 1 - i];
 	LightLock_Unlock(&s_lock);
 	return n;
 }

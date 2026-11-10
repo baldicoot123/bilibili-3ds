@@ -51,6 +51,7 @@ int cache_manager_enqueue_batch(const CacheEnqueueItem *items, int count,
 /* 按视频身份查找，不区分清晰度。同一 bvid+cid 只允许存在一个任务。 */
 int cache_manager_find(const char *bvid, int64_t cid, DownloadTask *out);
 int cache_manager_count(void);
+/* 界面快照按最新加入 -> 最早加入返回；内部队列仍保持 FIFO。 */
 int cache_manager_snapshot(DownloadTask *out, int max);
 
 int cache_manager_pause(const DownloadTask *task);
