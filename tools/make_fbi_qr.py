@@ -52,6 +52,10 @@ def validate_download(url: str, cia: Path) -> tuple[int, str]:
     with request(opener, url, "HEAD") as response:
         if response.status != 200:
             raise RuntimeError(f"HEAD status is {response.status}, expected 200")
+        if response.headers.get("Content-Encoding"):
+            raise RuntimeError(
+                "server applied Content-Encoding; FBI requires the raw CIA bytes"
+            )
         remote_size = int(response.headers.get("Content-Length", "0"))
         if remote_size != size:
             raise RuntimeError(
@@ -64,6 +68,8 @@ def validate_download(url: str, cia: Path) -> tuple[int, str]:
     with request(opener, url, "GET", {"Range": f"bytes=0-{last}"}) as response:
         if response.status != 206:
             raise RuntimeError(f"Range status is {response.status}, expected 206")
+        if response.headers.get("Content-Encoding"):
+            raise RuntimeError("Range response was compressed")
         expected_range = f"bytes 0-{last}/{size}"
         actual_range = response.headers.get("Content-Range", "")
         if actual_range != expected_range:
@@ -76,6 +82,24 @@ def validate_download(url: str, cia: Path) -> tuple[int, str]:
         local_prefix = stream.read(PREFIX_SIZE)
     if remote_prefix != local_prefix:
         raise RuntimeError("remote first 64 KiB does not match the local CIA")
+
+    full_hash = hashlib.sha256()
+    full_size = 0
+    with request(opener, url, "GET") as response:
+        if response.status != 200:
+            raise RuntimeError(f"full GET status is {response.status}, expected 200")
+        if response.headers.get("Content-Encoding"):
+            raise RuntimeError("full response was compressed")
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            full_size += len(chunk)
+            full_hash.update(chunk)
+    if full_size != size:
+        raise RuntimeError(f"full download size mismatch: remote={full_size}, local={size}")
+    if full_hash.hexdigest() != digest:
+        raise RuntimeError("full download SHA-256 does not match the local CIA")
     return size, digest
 
 
@@ -128,7 +152,7 @@ def main() -> int:
 
     raw_url = f"https://raw.githubusercontent.com/{args.repo}/main/{output.as_posix()}"
     print("FBI QR validation passed")
-    print(f"  HTTP: 200 HEAD, 206 Range, zero redirects")
+    print(f"  HTTP: 200 HEAD/GET, 206 Range, zero redirects, no content encoding")
     print(f"  Size: {size} bytes")
     print(f"  SHA-256: {digest}")
     print(f"  CIA URL: {cia_url}")
