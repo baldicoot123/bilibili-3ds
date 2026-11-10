@@ -22,7 +22,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def request(opener, url: str, method: str, headers: dict[str, str] | None = None):
-    req_headers = {"User-Agent": "bilibili-3ds-release-validator/1.0"}
+    # Match FBI's real HTTP request.  A generic validator can pass even when
+    # the CDN gzip-compresses the CIA, which makes FBI see the wrong length.
+    req_headers = {
+        "User-Agent": "FBI/2.6.1",
+        "Accept-Encoding": "gzip, deflate",
+    }
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, method=method, headers=req_headers)
@@ -95,7 +100,7 @@ def main() -> int:
 
     cia_url = (
         f"https://quantil.jsdelivr.net/gh/{args.repo}@main/"
-        f"downloads/bilibili-v{version}.cia"
+        f"downloads/bilibili-v{version}.cia.woff2"
     )
     try:
         size, digest = validate_download(cia_url, cia)
