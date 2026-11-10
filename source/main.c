@@ -89,7 +89,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.9.0"
+#define APP_VERSION "1.9.1"
 
 /* ---------- 分 P ----------
  * 与持久化队列上限一致，确保“一键缓存分P”拿到的不是当前可视区或前

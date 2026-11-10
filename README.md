@@ -1,6 +1,6 @@
 # bilibili for Nintendo 3DS
 
-**v1.9.0**
+**v1.9.1**
 
 本项目基于 [OakRoller/3Danmu](https://github.com/OakRoller/3Danmu) 开源代码开发，
 保留原项目 MIT 许可证与第三方组件声明。本仓库是非官方社区版本，与哔哩哔哩官方无隶属关系。
